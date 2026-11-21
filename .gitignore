@@ -1,26 +1,22 @@
-# --- Dati personali / sensibili (NON pubblicare) ---
-# Log con misure di salute reali (pressione, battito, stress)
-sync.log
-# Dump grezzo del canale bc (BC_DEBUG=1): account + dati salute in chiaro
-bc_raw.log
-bc_*.log
-# Prompt generato per l'analisi AI: contiene dati di salute reali dell'ultimo anno
-prompt.txt
-# Cattura grezza del traffico Bluetooth: MAC, seriali, dati salute
-docs/btsnoop_hci.log
+# Android
+.gradle/
+android/**/build/
+android/local.properties
+*.jks
+*.keystore
+
+# Rust
+server/target/
+
+# Local configuration, captures, and health data
+.env
 *.btsnoop
 btsnoop_hci.log
-
-# --- Ambiente Python (rigenerabile, contiene path della macchina) ---
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
-
-# --- File di sistema macOS ---
+bc_*.log
+sync.log
+prompt.txt
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 .DS_Store
-
-# --- Config locale con credenziali / indirizzo device ---
-.env
-!.env.example
+protocol/target/

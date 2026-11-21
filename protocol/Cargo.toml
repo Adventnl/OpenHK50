@@ -1,0 +1,20 @@
+[package]
+name = "openh-k50-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "openh_k50_protocol"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+android = ["dep:jni"]
+
+[dependencies]
+jni = { version = "0.21.1", optional = true, default-features = false }
+
+[profile.release]
+lto = true
+panic = "abort"
+strip = true

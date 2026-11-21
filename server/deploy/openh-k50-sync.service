@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenHK50 backup service
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/openh-k50-sync
+DynamicUser=yes
+StateDirectory=openh-k50
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/openh-k50
+LoadCredential=backup-key:/etc/openh-k50/backup-key
+UMask=0077
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
