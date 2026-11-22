@@ -1,5 +1,6 @@
 package org.openhk50.ui
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.DatePickerDialog
@@ -35,10 +36,13 @@ import org.openhk50.data.HealthStore
 import org.openhk50.data.Metric
 import org.openhk50.data.Origin
 import org.openhk50.data.Reading
+import org.openhk50.data.SleepNight
+import org.openhk50.data.SleepStage
 import org.openhk50.sync.BackupJob
 import java.text.NumberFormat
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
@@ -58,7 +62,7 @@ class MainActivity : Activity() {
     private lateinit var navigation: LinearLayout
     private var scroll: ScrollView? = null
     private var tab = Tab.TODAY
-    private var historyMetric = Metric.HEART
+    private var historyMetric: Metric? = Metric.HEART
     private var historyDate = LocalDate.now()
     private var shownRecords = 24
     private var currentDay: HealthStore.Day? = null
@@ -81,7 +85,11 @@ class MainActivity : Activity() {
         expanded = resources.configuration.screenWidthDp >= 680
         tab = savedInstanceState?.getString("tab")?.let(Tab::valueOf) ?: Tab.TODAY
         historyDate = savedInstanceState?.getString("day")?.let(LocalDate::parse) ?: LocalDate.now(band.zone)
-        historyMetric = savedInstanceState?.getString("metric")?.let(Metric::valueOf) ?: Metric.HEART
+        historyMetric = when (val metric = savedInstanceState?.getString("metric")) {
+            null -> Metric.HEART
+            "SLEEP" -> null
+            else -> Metric.valueOf(metric)
+        }
         permissionAction = savedInstanceState?.getString("permission")?.let(PermissionAction::valueOf)
         buildShell()
         setupWindow()
@@ -103,7 +111,7 @@ class MainActivity : Activity() {
                 currentDay = null
                 loadData()
             }
-            if (tab == Tab.TODAY || tab == Tab.BAND) drawScreen(keepScroll = true)
+            if (tab != Tab.BACKUP) drawScreen(keepScroll = true)
         }
         band.foreground(true)
         if (app.settings.state().endpoint != null) BackupJob.schedule(this)
@@ -126,7 +134,7 @@ class MainActivity : Activity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("tab", tab.name)
         outState.putString("day", historyDate.toString())
-        outState.putString("metric", historyMetric.name)
+        outState.putString("metric", historyMetric?.name ?: "SLEEP")
         outState.putString("permission", permissionAction?.name)
         super.onSaveInstanceState(outState)
     }
@@ -144,12 +152,13 @@ class MainActivity : Activity() {
             @Suppress("DEPRECATION")
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                (if (palette.night) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
+                (if (palette.night) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR) or
+                (if (!palette.night && Build.VERSION.SDK_INT >= 27) View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR else 0)
         }
         @Suppress("DEPRECATION")
         window.statusBarColor = Color.TRANSPARENT
         @Suppress("DEPRECATION")
-        window.navigationBarColor = Color.TRANSPARENT
+        window.navigationBarColor = if (Build.VERSION.SDK_INT >= 27) Color.TRANSPARENT else Color.BLACK
         window.setBackgroundDrawable(shape(palette.background, 0))
     }
 
@@ -167,13 +176,6 @@ class MainActivity : Activity() {
             }
             insets
         }
-
-        val bar = row().apply { setPadding(dp(24), 0, dp(24), 0) }
-        val mark = FrameLayout(this).apply { background = shape(palette.brand, 10) }
-        mark.addView(Icon(this, Glyph.PULSE, palette.onBrand), FrameLayout.LayoutParams(dp(21), dp(21), Gravity.CENTER))
-        bar.addView(mark, lp(dp(34), dp(34)))
-        bar.addView(label("OpenHK50", 19, palette.ink, "sans-serif-medium"), lp(-2, -2).apply { marginStart = dp(11) })
-        root.addView(bar, lp(-1, dp(61)))
 
         content = FrameLayout(this)
         navigation = if (expanded) column() else row()
@@ -193,13 +195,14 @@ class MainActivity : Activity() {
 
     private fun drawNavigation() {
         navigation.removeAllViews()
-        navigation.setPadding(dp(8), dp(5), dp(8), dp(5))
+        navigation.setPadding(dp(8), dp(6), dp(8), dp(6))
+        navigation.setBackgroundColor(if (expanded) palette.background else palette.surface)
         for (item in Tab.entries) {
             val selected = item == tab
             val color = if (selected) palette.brand else palette.muted
             val cell = column().apply {
                 gravity = Gravity.CENTER
-                minimumHeight = dp(if (expanded) 74 else 61)
+                minimumHeight = dp(if (expanded) 74 else 54)
                 contentDescription = item.title
                 isSelected = selected
                 isFocusable = true
@@ -222,7 +225,6 @@ class MainActivity : Activity() {
         tab = next
         queryGeneration++
         backupMessage = null
-        if (next == Tab.HISTORY) historyDate = LocalDate.now(band.zone)
         if (next == Tab.HISTORY || next == Tab.TODAY) currentDay = null
         drawNavigation()
         updateBack()
@@ -243,9 +245,10 @@ class MainActivity : Activity() {
     }
 
     @Suppress("DEPRECATION")
+    @SuppressLint("GestureBackNavigation") // updateBack handles API 33+ with the platform dispatcher.
     @Deprecated("Required on Android 12 and earlier")
     override fun onBackPressed() {
-        if (tab == Tab.TODAY) super.onBackPressed() else go(Tab.TODAY)
+        if (Build.VERSION.SDK_INT < 33 && tab != Tab.TODAY) go(Tab.TODAY) else super.onBackPressed()
     }
 
     private fun loadData() {
@@ -274,7 +277,7 @@ class MainActivity : Activity() {
 
     private fun drawScreen(keepScroll: Boolean = false) {
         val previous = if (keepScroll) scroll?.scrollY ?: 0 else 0
-        val page = column().apply { setPadding(dp(22), dp(9), dp(22), dp(22)) }
+        val page = column().apply { setPadding(dp(22), dp(18), dp(22), dp(26)) }
         val viewport = ScrollView(this).apply {
             isFillViewport = true
             isVerticalScrollBarEnabled = false
@@ -303,32 +306,54 @@ class MainActivity : Activity() {
         val today = LocalDate.now(zone)
         lastShownDate = today
         title(page, "Today", today.format(LONG_DATE))
-        block(page, connectionStrip(state), top = 20)
+        block(page, connectionStrip(state), 21)
         app.storageIssue?.let { note(page, it, 12, true) }
         readIssue?.let { note(page, it, 12, true) }
 
         val day = currentDay
-        val samples = day?.heart.orEmpty()
-        val steps = day?.steps.orEmpty()
-        val last = day?.latestHeart
-        val heart = metricPanel(
-            Metric.HEART, samples, today, zone,
-            state.liveHeart?.takeIf { state.action == BandAction.MEASURING }?.toLong() ?: samples.lastOrNull()?.value?.toLong()
-        )
-        if (samples.isEmpty() && last != null && state.action != BandAction.MEASURING) {
-            note(heart, "Last reading ${last.value} bpm · ${dateTime(last.time, zone)}", 2)
-        }
-        val measuring = state.action == BandAction.MEASURING
-        addButton(heart, if (measuring) "Stop measurement" else "Measure heart rate",
-            enabled = measuring || state.connection == Connection.CONNECTED && state.action == BandAction.IDLE,
-            top = 12, filled = false) {
-            if (measuring) band.stopMeasurement() else band.measure()
-        }
-        if (state.action != BandAction.IMPORTING) state.message?.let { note(heart, it, 7) }
-        block(page, heart, 14)
+        heading(page, "Activity", 26)
+        val activity = panel()
+        activity.addView(summaryRow(Metric.STEPS, day?.value(Metric.STEPS)) { openHistory(Metric.STEPS, today) }, lp(-1, -2))
+        val steps = day?.readings(Metric.STEPS).orEmpty()
+        if (steps.isNotEmpty()) block(activity, SeriesChart(this, palette, Metric.STEPS, today, zone, steps), 4, dp(112))
+        block(page, activity, 9)
 
-        block(page, metricPanel(Metric.STEPS, steps, today, zone,
-            day?.stepTotal?.takeIf { steps.isNotEmpty() }), 12)
+        heading(page, "Health", 26)
+        val health = panel()
+        for (metric in Metric.entries.filter { it != Metric.STEPS }) {
+            if (health.childCount > 0) divider(health)
+            val value = state.liveValue?.toLong()?.takeIf { state.measurement == metric } ?: day?.value(metric)
+            health.addView(summaryRow(metric, value) { openHistory(metric, today) }, lp(-1, -2))
+        }
+        divider(health)
+        health.addView(summaryRow("Sleep", Glyph.MOON, palette.brand, day?.sleep?.let { duration(it.asleepMinutes) }) {
+            openHistory(null, today)
+        }, lp(-1, -2))
+        block(page, health, 9)
+    }
+
+    private fun openHistory(metric: Metric?, day: LocalDate) {
+        historyMetric = metric
+        historyDate = day
+        shownRecords = 24
+        go(Tab.HISTORY)
+    }
+
+    private fun summaryRow(metric: Metric, value: Long?, action: () -> Unit) =
+        summaryRow(metric.title, metric.icon, palette.accent(metric), value?.let { displayValue(metric, it) }, action)
+
+    private fun summaryRow(title: String, icon: Glyph, accent: Int, value: String?, action: () -> Unit) = row().apply {
+        minimumHeight = dp(55)
+        setPadding(0, dp(7), 0, dp(7))
+        background = pressable(Color.TRANSPARENT, palette.ink, 11)
+        isFocusable = true
+        contentDescription = "$title, ${value ?: "no reading"}"
+        setOnClickListener { action() }
+        addView(Icon(this@MainActivity, icon, accent), lp(dp(23), dp(23)))
+        addView(label(title, 16, palette.ink, "sans-serif-medium"), lp(0, -2, 1f).apply { marginStart = dp(12) })
+        addView(label(value ?: "—", 15, palette.muted),
+            lp(-2, -2).apply { marginStart = dp(8) })
+        addView(Icon(this@MainActivity, Glyph.RIGHT, palette.muted), lp(dp(15), dp(15)).apply { marginStart = dp(8) })
     }
 
     private fun history(page: LinearLayout) {
@@ -357,43 +382,100 @@ class MainActivity : Activity() {
         dateRow.addView(iconButton(Glyph.RIGHT, "Next day", historyDate < today) { selectDate(historyDate.plusDays(1)) }, lp(dp(48), dp(52)))
         block(page, dateRow, 18)
 
-        val selectors = row()
-        for (metric in Metric.entries) {
-            val current = metric == historyMetric
-            val button = button(metricTitle(metric), filled = current) {
-                historyMetric = metric
-                shownRecords = 24
-                drawScreen()
+        val metric = historyMetric
+        val metricName = metric?.title ?: "Sleep"
+        val picker = row().apply {
+            minimumHeight = dp(52)
+            setPadding(dp(15), dp(6), dp(15), dp(6))
+            background = pressable(palette.surface, palette.brand, 15)
+            contentDescription = "$metricName, choose metric"
+            isFocusable = true
+            addView(Icon(this@MainActivity, metric?.icon ?: Glyph.MOON, metric?.let(palette::accent) ?: palette.brand),
+                lp(dp(21), dp(21)))
+            addView(label(metricName, 16, palette.ink, "sans-serif-medium"), lp(0, -2, 1f).apply { marginStart = dp(11) })
+            addView(Icon(this@MainActivity, Glyph.DOWN, palette.brand), lp(dp(19), dp(19)))
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity).setTitle("Health metric")
+                    .setSingleChoiceItems((Metric.entries.map { it.title } + "Sleep").toTypedArray(),
+                        metric?.ordinal ?: Metric.entries.size) { dialog, which ->
+                        historyMetric = Metric.entries.getOrNull(which)
+                        shownRecords = 24
+                        dialog.dismiss()
+                        drawScreen(keepScroll = true)
+                    }.setNegativeButton("Cancel", null).show()
             }
-            button.isSelected = current
-            selectors.addView(button, lp(0, -2, 1f).apply { if (metric == Metric.STEPS) marginStart = dp(8) })
         }
-        block(page, selectors, 12)
+        block(page, picker, 10)
         readIssue?.let { note(page, it, 12, true) }
 
-        val values = if (historyMetric == Metric.HEART) day?.heart.orEmpty() else day?.steps.orEmpty()
-        val value = if (historyMetric == Metric.HEART) values.lastOrNull()?.value?.toLong()
-            else day?.stepTotal?.takeIf { values.isNotEmpty() }
-        block(page, metricPanel(historyMetric, values, historyDate, zone, value), 14)
+        if (metric == null) {
+            block(page, sleepPanel(day?.sleep), 16)
+            return
+        }
+        val values = day?.readings(metric).orEmpty()
+        val state = band.state
+        val currentMeasurement = state.measurement == metric && historyDate == today
+        val value = state.liveValue?.takeIf { currentMeasurement }?.toLong() ?: day?.value(metric)
+        val detail = metricPanel(metric, values, historyDate, zone, value)
+        if (historyDate == today && metric.liveType != null) {
+            val measuring = currentMeasurement && state.action == BandAction.MEASURING
+            if (state.connection == Connection.CONNECTED) {
+                addButton(detail, if (measuring) "Stop measurement" else "Measure",
+                    enabled = measuring || state.action == BandAction.IDLE, top = 12) {
+                    if (measuring) band.stopMeasurement() else band.measure(metric)
+                }
+                if (measuring && state.liveValue == null) note(detail, "Keep your wrist still.", 8)
+                if (currentMeasurement) state.measurementMessage?.let { note(detail, it, 8, true) }
+            } else {
+                addButton(detail, "Connect band", filled = false, top = 12) { go(Tab.BAND) }
+            }
+        }
+        block(page, detail, 16)
         if (values.isEmpty()) return
 
-        val header = label("Readings", 21, palette.ink, "sans-serif-medium").apply { if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true }
-        block(page, header, 23)
+        heading(page, "Readings", 23)
         val records = panel()
         for (record in values.asReversed().take(shownRecords)) {
-            if (records.childCount > 0) records.addView(View(this).apply { setBackgroundColor(palette.border) }, lp(-1, dp(1)))
+            if (records.childCount > 0) divider(records)
             val line = row().apply { minimumHeight = dp(46) }
             val timestamp = TIME.format(Instant.ofEpochMilli(record.time).atZone(zone))
             val detail = if (record.origin == Origin.LIVE) "$timestamp · Spot check" else timestamp
             line.addView(label(detail, 14, palette.muted), lp(0, -2, 1f))
-            val unit = if (record.metric == Metric.HEART) "bpm" else "steps"
-            line.addView(label("${number(record.value.toLong())} $unit", 15, palette.ink, "sans-serif-medium"))
+            line.addView(label(displayValue(record.metric, record.value.toLong()), 15, palette.ink, "sans-serif-medium"))
             records.addView(line, lp(-1, -2))
         }
         block(page, records, 10)
         if (shownRecords < values.size) addButton(page, "Show more readings", filled = false, top = 12) {
             shownRecords += 24
             drawScreen(keepScroll = true)
+        }
+    }
+
+    private fun sleepPanel(night: SleepNight?) = panel().apply {
+        if (night == null) {
+            note(this, if (currentDay == null && readIssue == null) "Loading readings…" else "No sleep recorded", 3)
+            val state = band.state
+            if (state.detailSyncAvailable && !state.detailSyncEnabled) {
+                addButton(this, "Set up sleep sync", enabled = state.action == BandAction.IDLE, top = 12) {
+                    detailsDialog(false)
+                }
+            }
+            return@apply
+        }
+        addView(label(duration(night.asleepMinutes), 43, palette.brand, "sans-serif-medium").apply {
+            letterSpacing = -.035f
+        }, lp(-1, -2))
+        val start = LocalTime.ofSecondOfDay(night.startMinute * 60L)
+        note(this, "Sleep began at ${TIME.format(start)}", 5)
+        block(this, SleepTimeline(this@MainActivity, palette, night.segments), 18, dp(20))
+        for (stage in SleepStage.entries) {
+            val minutes = night.segments.filter { it.stage == stage }.sumOf { it.minutes }
+            if (minutes == 0) continue
+            val line = row().apply { minimumHeight = dp(37) }
+            line.addView(View(this@MainActivity).apply { background = shape(palette.sleepColor(stage), 5) }, lp(dp(10), dp(10)))
+            line.addView(label(stage.title, 15, palette.ink), lp(0, -2, 1f).apply { marginStart = dp(10) })
+            line.addView(label(duration(minutes), 15, palette.muted))
+            block(this, line, 0)
         }
     }
 
@@ -406,90 +488,166 @@ class MainActivity : Activity() {
     }
 
     private fun connectionStrip(state: BandState): View {
+        val device = state.connecting ?: state.device
         val line = row().apply {
-            minimumHeight = dp(68)
-            setPadding(dp(12), dp(9), dp(13), dp(9))
-            background = pressable(palette.tint, palette.ink, 15)
+            minimumHeight = dp(76)
+            setPadding(dp(14), dp(12), dp(15), dp(12))
+            background = pressable(palette.tint, palette.brand, 17)
             isFocusable = true
             setOnClickListener { go(Tab.BAND) }
         }
-        val mark = FrameLayout(this).apply { background = shape(palette.surface, 11) }
-        mark.addView(Icon(this, Glyph.BAND, palette.brand), FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
-        line.addView(mark, lp(dp(40), dp(40)))
+        line.addView(Icon(this, Glyph.BAND, palette.brand), lp(dp(32), dp(32)))
         val words = column()
-        words.addView(label(state.device?.name ?: "Pair your band", 15, palette.ink, "sans-serif-medium"))
-        words.addView(label(if (state.device == null) "Bluetooth setup" else connectionText(state), 13, palette.muted))
-        line.addView(words, lp(0, -2, 1f).apply { marginStart = dp(11) })
-        if (state.battery != null) line.addView(label("${state.battery}%", 15, palette.brand, "sans-serif-medium")
-            .apply { contentDescription = "${state.battery} percent battery" })
-        else line.addView(Icon(this, Glyph.RIGHT, palette.brand), lp(dp(20), dp(20)))
+        words.addView(label(device?.name ?: "Connect a band", 17, palette.ink, "sans-serif-medium"))
+        words.addView(label(
+            if (device == null) "HK50 and H59" else connectionText(state), 13, palette.muted
+        ), lp(-1, -2).apply { topMargin = dp(3) })
+        line.addView(words, lp(0, -2, 1f).apply { marginStart = dp(12) })
+        val battery = state.battery
+        if (battery != null) line.addView(label("$battery%", 17, palette.brand, "sans-serif-medium")
+            .apply { contentDescription = "$battery percent battery" })
+        line.addView(Icon(this, Glyph.RIGHT, palette.brand), lp(dp(16), dp(16)).apply { marginStart = dp(7) })
         return line
     }
 
     private fun bandPage(page: LinearLayout) {
         val state = band.state
+        val current = state.connecting ?: state.device
+        val connected = state.connection == Connection.CONNECTED
+        val idle = state.action == BandAction.IDLE
         title(page, "Band")
-        val devicePanel = panel()
-        section(devicePanel, Glyph.BLUETOOTH, state.device?.name ?: "Connect your HK50", palette.brand)
-        note(devicePanel, if (state.device == null) "Keep your band nearby and scan for it." else connectionText(state), 7)
+
+        val devicePanel = panel().apply {
+            background = shape(palette.tint, 18)
+            setPadding(dp(17), dp(17), dp(17), dp(17))
+        }
+        val identity = row()
+        identity.addView(Icon(this, Glyph.BAND, palette.brand), lp(dp(48), dp(48)))
+        val words = column()
+        words.addView(label(current?.name ?: "Connect your band", 23, palette.ink, "sans-serif-medium"))
+        note(words, if (current == null) "Keep your HK50 or H59 nearby." else connectionText(state), 4)
+        identity.addView(words, lp(0, -2, 1f).apply { marginStart = dp(13) })
+        devicePanel.addView(identity, lp(-1, -2))
         state.battery?.let {
-            devicePanel.addView(row().apply {
-                addView(Icon(this@MainActivity, Glyph.BATTERY, palette.brand), lp(dp(22), dp(22)))
-                addView(label(if (state.charging) "$it% · Charging" else "$it% battery", 16, palette.ink, "sans-serif-medium"),
-                    lp(-2, -2).apply { marginStart = dp(9) })
-            }, lp(-1, -2).apply { topMargin = dp(10) })
+            val batteryLine = row()
+            batteryLine.addView(Icon(this, Glyph.BATTERY, palette.brand), lp(dp(22), dp(22)))
+            batteryLine.addView(label(if (state.charging) "$it% · Charging" else "$it% battery", 16, palette.ink, "sans-serif-medium"),
+                lp(-2, -2).apply { marginStart = dp(8) })
+            block(devicePanel, batteryLine, 14)
         }
-        if (state.device != null && state.connection == Connection.DISCONNECTED) {
-            addButton(devicePanel, "Reconnect", top = 12) { bluetooth(PermissionAction.RECONNECT) }
-        } else if (state.connection == Connection.CONNECTING) {
-            addButton(devicePanel, "Cancel connection", filled = false, top = 12) { band.disconnect() }
-        }
-        if (state.action == BandAction.IMPORTING) {
+        state.lastSync?.takeIf { idle }?.let { note(devicePanel, "Last sync ${dateTime(it, band.zone)}", 9) }
+        if (state.action == BandAction.IMPORTING && state.days > 1) {
             val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-                max = state.days.coerceAtLeast(1)
+                max = state.days
                 this.progress = state.progress
                 progressTintList = ColorStateList.valueOf(palette.brand)
                 progressBackgroundTintList = ColorStateList.valueOf(palette.border)
-                contentDescription = "Importing day ${state.progress} of ${state.days}"
+                contentDescription = "Syncing day ${state.progress} of ${state.days}"
             }
-            block(devicePanel, progress, 8, dp(7))
+            block(devicePanel, progress, 10, dp(7))
         }
-        state.message?.let { note(devicePanel, it, 9) }
-        block(page, devicePanel, 18)
+        state.message?.let { note(devicePanel, it, 12) }
+        when (state.connection) {
+            Connection.DISCONNECTED -> {
+                if (state.device == null) {
+                    addButton(devicePanel, if (state.scanning) "Stop scan" else "Scan for bands", top = 16) {
+                        if (state.scanning) band.stopScan() else bluetooth(PermissionAction.SCAN)
+                    }
+                } else {
+                    addButton(devicePanel, "Reconnect", enabled = !state.scanning, top = 16) {
+                        bluetooth(PermissionAction.RECONNECT)
+                    }
+                }
+            }
+            Connection.CONNECTING -> addButton(devicePanel, "Cancel", filled = false, top = 16) { band.disconnect() }
+            Connection.CONNECTED -> addButton(devicePanel, "Sync now", enabled = idle, top = 16) { band.importHistory(false) }
+        }
+        block(page, devicePanel, 20)
 
-        if (state.connection == Connection.CONNECTED) {
+        if (connected) {
+            heading(page, "Settings", 25)
             val actions = panel()
-            section(actions, Glyph.CLOCK, "Band controls", palette.brand)
-            val enabled = state.action == BandAction.IDLE
-            addButton(actions, "Import recent history", enabled, top = 12) { band.importHistory(true) }
-            addButton(actions, "Set band clock", enabled, filled = false, top = 8) { band.setClock() }
-            addButton(actions, "Heart-rate logging", enabled, filled = false, top = 8) {
+            actionRow(actions, "Sync past 7 days", Glyph.CALENDAR, idle) { band.importHistory(true) }
+            actionRow(actions, "Set band clock", Glyph.CLOCK, idle) { band.setClock() }
+            actionRow(actions, "Heart-rate logging", Glyph.PULSE, idle) {
                 AlertDialog.Builder(this).setTitle("Heart-rate logging")
                     .setItems(arrayOf("Record every 5 minutes", "Pause logging")) { _, which -> band.setLogging(which == 0) }
                     .setNegativeButton("Cancel", null).show()
             }
-            addButton(actions, "Disconnect", enabled, filled = false, top = 8) { band.disconnect() }
-            block(page, actions, 12)
-        }
-
-        val nearby = panel()
-        section(nearby, Glyph.BAND, "Nearby bands", palette.brand)
-        val scanAllowed = state.action == BandAction.IDLE && state.connection != Connection.CONNECTING
-        addButton(nearby, if (state.scanning) "Scanning…" else "Scan for bands",
-            enabled = scanAllowed && !state.scanning, filled = state.device == null, top = 12) {
-            bluetooth(PermissionAction.SCAN)
-        }
-        if (state.searched && !state.scanning && state.nearby.isEmpty() && state.message == null) {
-            note(nearby, "No bands found. Close any other band app and scan again.", 8)
-        }
-        for (candidate in state.nearby) {
-            if (candidate.address == state.device?.address && state.connection == Connection.CONNECTED) continue
-            val item = button(candidate.name, filled = false, enabled = scanAllowed) { band.connect(candidate) }.apply {
-                contentDescription = "${candidate.name}, address ${candidate.address}"
+            if (state.detailSyncAvailable) {
+                actionRow(actions, if (state.detailSyncEnabled) "Sleep and oxygen sync" else "Set up sleep and oxygen",
+                    Glyph.MOON, idle) { detailsDialog(state.detailSyncEnabled) }
             }
-            block(nearby, item, 8)
+            actionRow(actions, "Disconnect", Glyph.BLUETOOTH, true) { band.disconnect() }
+            block(page, actions, 9)
+        } else if (state.connection == Connection.DISCONNECTED) {
+            if (state.device != null || state.scanning || state.searched || state.nearby.isNotEmpty()) {
+                heading(page, "Nearby bands", 25)
+                val nearby = panel()
+                if (state.device != null) actionRow(nearby, if (state.scanning) "Stop scan" else "Scan for bands",
+                    Glyph.SCAN, true) { if (state.scanning) band.stopScan() else bluetooth(PermissionAction.SCAN) }
+                if (state.scanning) note(nearby, "Scanning…", if (nearby.childCount == 0) 3 else 9)
+                else if (state.searched && state.nearby.isEmpty() && state.message == null) {
+                    note(nearby, "No bands found. Disconnect the band from other apps and scan again.", 3)
+                }
+                for (candidate in state.nearby) {
+                    actionRow(nearby, candidate.name, Glyph.BAND, true, candidate.address) { band.connect(candidate) }
+                }
+                if (nearby.childCount > 0) block(page, nearby, 9)
+            }
+            if (state.device != null && !state.scanning) {
+                addButton(page, "Forget band", filled = false, top = 18) {
+                    AlertDialog.Builder(this).setTitle("Forget this band?")
+                        .setMessage("Readings stay on this phone.")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Forget") { _, _ -> band.forget() }.show()
+                }
+            }
         }
-        block(page, nearby, 12)
+    }
+
+    private fun detailsDialog(configured: Boolean) {
+        val fields = column().apply { setPadding(dp(22), dp(3), dp(22), 0) }
+        val username = EditText(this).apply {
+            hint = "QWatch username or email"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+            setSingleLine()
+            isSaveEnabled = false
+        }
+        fields.addView(username, lp(-1, -2))
+        note(fields, "Use the QWatch username already linked to this band.", 6)
+        val builder = AlertDialog.Builder(this).setTitle("Sleep and oxygen sync").setView(fields)
+            .setNegativeButton("Cancel", null).setPositiveButton("Save & sync", null)
+        if (configured) builder.setNeutralButton("Turn off") { _, _ -> band.setDetailUsername(null) }
+        val dialog = builder.create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (band.setDetailUsername(username.text.toString())) dialog.dismiss()
+                else username.error = if (band.state.action == BandAction.IDLE && band.state.detailSyncAvailable)
+                    "Enter a valid QWatch username." else "Reconnect to the band and try again."
+            }
+        }
+        dialog.show()
+    }
+
+    private fun actionRow(parent: LinearLayout, title: String, glyph: Glyph, enabled: Boolean,
+                          detail: String? = null, action: () -> Unit) {
+        if (parent.childCount > 0) divider(parent)
+        val line = row().apply {
+            minimumHeight = dp(52)
+            setPadding(0, dp(8), 0, dp(8))
+            background = pressable(Color.TRANSPARENT, palette.brand, 10)
+            isEnabled = enabled
+            isFocusable = enabled
+            setOnClickListener { action() }
+            addView(Icon(this@MainActivity, glyph, if (enabled) palette.brand else palette.muted), lp(dp(22), dp(22)))
+            val words = column()
+            words.addView(label(title, 16, if (enabled) palette.ink else palette.muted, "sans-serif-medium"))
+            detail?.let { note(words, it, 3) }
+            addView(words, lp(0, -2, 1f).apply { marginStart = dp(11) })
+            addView(Icon(this@MainActivity, Glyph.RIGHT, palette.muted), lp(dp(15), dp(15)))
+        }
+        parent.addView(line, lp(-1, -2))
     }
 
     private fun backupPage(page: LinearLayout) {
@@ -649,45 +807,56 @@ class MainActivity : Activity() {
         Connection.DISCONNECTED -> "Disconnected"
         Connection.CONNECTING -> "Connecting…"
         Connection.CONNECTED -> when (state.action) {
-            BandAction.IMPORTING -> "Importing from band…"
-            BandAction.MEASURING -> "Measuring heart rate…"
+            BandAction.IMPORTING -> "Syncing…"
+            BandAction.MEASURING -> "Measuring…"
             BandAction.SETTING -> "Updating band…"
             BandAction.IDLE -> "Connected"
         }
     }
 
     private fun metricPanel(metric: Metric, readings: List<Reading>, date: LocalDate, zone: ZoneId, value: Long?): LinearLayout {
-        val heart = metric == Metric.HEART
-        val accent = if (heart) palette.heart else palette.steps
         return panel().apply {
-            section(this, if (heart) Glyph.PULSE else Glyph.WALK, metricTitle(metric), accent)
+            val accent = palette.accent(metric)
             if (value == null) {
-                note(this, if (currentDay == null && readIssue == null) "Loading readings…" else
-                    if (heart) "No heart-rate readings" else "No step readings", 12)
+                note(this, if (currentDay == null && readIssue == null) "Loading readings…" else "No readings for this day", 3)
             } else {
                 val numberRow = row().apply {
                     gravity = Gravity.BOTTOM
-                    addView(label(number(value), 39, palette.ink, "sans-serif-light").apply { letterSpacing = -.025f })
-                    addView(label(if (heart) "bpm" else "steps", 15, palette.muted), lp(-2, -2).apply {
-                        marginStart = dp(7)
-                        bottomMargin = dp(7)
-                    })
+                    addView(label(number(value), 43, accent, "sans-serif-medium").apply { letterSpacing = -.035f })
+                    if (metric.unit.isNotEmpty()) {
+                        addView(label(metric.unit, 15, palette.muted), lp(-2, -2).apply {
+                            marginStart = dp(6)
+                            bottomMargin = dp(6)
+                        })
+                    }
                 }
-                block(this, numberRow, 8)
+                addView(numberRow, lp(-1, -2))
+                if (metric != Metric.STEPS && readings.isNotEmpty()) {
+                    note(this, "Latest · ${TIME.format(Instant.ofEpochMilli(readings.last().time).atZone(zone))}", 4)
+                }
             }
             if (readings.isNotEmpty()) {
-                block(this, SeriesChart(this@MainActivity, palette, metric, date, zone, readings), 6, dp(114))
+                block(this, SeriesChart(this@MainActivity, palette, metric, date, zone, readings), 11, dp(142))
             }
         }
     }
 
     private fun title(page: LinearLayout, text: String, detail: String? = null) {
-        page.addView(label(text, 40, palette.ink, "sans-serif-medium").apply {
-            letterSpacing = -.034f
+        page.addView(label(text, 44, palette.ink, "sans-serif-black").apply {
+            letterSpacing = -.038f
             if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
         })
-        detail?.let { note(page, it, 2) }
+        detail?.let { note(page, it, 4) }
     }
+
+    private fun heading(page: LinearLayout, text: String, top: Int) =
+        block(page, label(text, 23, palette.ink, "sans-serif-medium").apply {
+            letterSpacing = -.025f
+            if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+        }, top)
+
+    private fun divider(parent: LinearLayout) =
+        parent.addView(View(this).apply { setBackgroundColor(palette.border) }, lp(-1, dp(1)))
 
     private fun section(panel: LinearLayout, glyph: Glyph, text: String, accent: Int) {
         val header = row()
@@ -701,8 +870,8 @@ class MainActivity : Activity() {
         block(parent, label(text, 14, if (warning) palette.warning else palette.muted).apply { setLineSpacing(dp(2).toFloat(), 1f) }, top)
 
     private fun panel() = column().apply {
-        background = shape(palette.surface, 16, palette.border)
-        setPadding(dp(15), dp(14), dp(15), dp(14))
+        background = shape(palette.surface, 16)
+        setPadding(dp(15), dp(11), dp(15), dp(11))
     }
 
     private fun iconButton(glyph: Glyph, description: String, enabled: Boolean, action: () -> Unit): FrameLayout {
@@ -746,6 +915,7 @@ class MainActivity : Activity() {
         textSize = size.toFloat()
         setTextColor(color)
         typeface = Typeface.create(face, Typeface.NORMAL)
+        fontFeatureSettings = "'tnum'"
         includeFontPadding = false
     }
 
@@ -755,8 +925,15 @@ class MainActivity : Activity() {
     private fun column() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
     private fun row() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
     private fun lp(width: Int, height: Int, weight: Float = 0f) = LinearLayout.LayoutParams(width, height, weight)
-    private fun metricTitle(metric: Metric) = if (metric == Metric.HEART) "Heart rate" else "Steps"
+    private fun displayValue(metric: Metric, value: Long) = when (metric.unit) {
+        "%" -> "${number(value)}%"
+        "" -> number(value)
+        else -> "${number(value)} ${metric.unit}"
+    }
     private fun number(value: Long) = NumberFormat.getIntegerInstance().format(value)
+    private fun duration(minutes: Int) =
+        if (minutes < 60) "${number(minutes.toLong())} min"
+        else "${number((minutes / 60).toLong())} hr ${number((minutes % 60).toLong())} min"
     private fun dateTime(time: Long, zone: ZoneId) = DATE_TIME.format(Instant.ofEpochMilli(time).atZone(zone))
 
     companion object {

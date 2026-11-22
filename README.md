@@ -1,6 +1,6 @@
 # OpenHK50
 
-A local-first Android companion for the HK50 screenless band. OpenHK50 pairs directly over Bluetooth LE and keeps heart-rate and step readings on the phone. The app follows Android’s light and dark themes. Home-server backup is optional.
+OpenHK50 is an Android companion for HK50 and H59 bands. It uses Nordic’s Android BLE library to connect directly to the band. Today and History show readings stored on the phone, with optional home-server backup for heart rate and steps.
 
 ## Build and run
 
@@ -19,11 +19,15 @@ On Windows use `gradlew.bat`; keep the Rust tools on `PATH`. The APK supports An
 
 ## Use the band
 
-1. Open **Band**, scan, and select **HK50_3806**. Close other apps connected to the band if it doesn’t appear.
-2. Open **Today** for battery status, the latest heart rate, and step totals from downloaded intervals. Use **Measure heart rate** for a spot check.
-3. Open **History** and pick a date. The app imports today on connect and refreshes while it’s open. **Import recent history** requests up to seven days, subject to what the band retains. Pair in the time zone used by the band’s clock. **Set band clock** and **Heart-rate logging** are explicit band settings.
+1. On the Android phone, open **Band → Scan for bands**, allow nearby device access, and select your band, for example **HK50_3806**. Disconnect it in QWatch Pro or nRF Connect before scanning if either app is using it.
+2. Open **Today** for battery and the latest readings. Tap a metric to open **History**. Heart rate, blood oxygen, and stress offer **Measure** for the current day while the band is connected.
+3. **Band → Sync now** fetches today. **Sync past 7 days** requests recent history. For firmware exposing sleep and blood oxygen history, **Set up sleep and oxygen** uses the QWatch username already linked to the band. The app sends the username to the band over BLE and stores it on the phone.
 
-The HK50 battery round trip is confirmed by the original device check. Live heart rate, history, clock, and logging commands use the [H59 protocol reference](docs/reference/OpenH59.md) and still require confirmation on an HK50. Empty history stays empty. Phone-side BLE collection runs while the app is open. The HK50 may continue filling its own history between connections if logging is enabled and supported.
+The band reconnects and syncs while the app is open. Pair in the time zone used by the band clock. **Set band clock** and **Heart-rate logging** are manual controls.
+
+The original HK50 hardware check confirmed the battery command. Other commands use the [H59 protocol reference](docs/reference/OpenH59.md) and depend on the HK50 firmware. Historical oxygen values are hourly maxima. For a manual nRF Connect check, subscribe to `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` and write the hex battery request `03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03` to `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`. In a valid `03` response the next byte is the percentage.
+
+Run `./gradlew :app:testDebugUnitTest :app:lintDebug` in `android/` to check the Android app. Run the Rust codec checks from the repository root with `cargo test --locked --manifest-path protocol/Cargo.toml`.
 
 ## Back up to Ubuntu
 
@@ -41,11 +45,11 @@ sudo systemctl enable --now openh-k50-sync
 
 Expose the service through a phone-reachable HTTPS reverse proxy. Use an Android-trusted certificate and keep the backend listener on loopback. The [Caddy example](server/deploy/Caddyfile.example) forwards the sync route. You can administer the Ubuntu host through Link Tunnel and inspect the backend from a paired computer with `nexus forward <ubuntu-device> 8745:127.0.0.1:8745`. The Android scheduler needs its own route to the HTTPS hostname, such as your home network or an existing private network.
 
-In **Backup → Set up backup**, enter the HTTPS origin and the key from `/etc/openh-k50/backup-key`. Keep that key in a password manager. Android schedules sync roughly hourly when network and battery policies permit. To restore after reinstalling, enter the same URL and key and let **Sync now** finish. The app merges backed-up readings into SQLite. Sync failures leave the phone’s data intact. Use SQLite’s `.backup` command or stop the service before taking a server database snapshot.
+In **Backup → Set up backup**, enter the HTTPS origin and the key from `/etc/openh-k50/backup-key`. Android schedules heart-rate and step backups roughly hourly when network and battery policies permit. To restore those readings after reinstalling, enter the same URL and key and let **Sync now** finish. Sleep, blood oxygen, stress, and heart-rate variability are stored on the phone. Use SQLite’s `.backup` command or stop the service before taking a server database snapshot.
 
 ## Source layout
 
-- `android/` Kotlin app, Android BLE, SQLite, UI, and scheduled backup.
+- `android/` Kotlin app, Nordic BLE, SQLite, UI, and scheduled backup.
 - `protocol/` Rust BLE codec with a thin Android JNI binding. Run its checks with `cargo test --locked --manifest-path protocol/Cargo.toml`.
 - `server/` Rust sync service, SQLite storage, and Ubuntu deployment files.
 - `docs/reference/` H59 notes. The [original Python client and dashboard](https://github.com/Adventnl/OpenHK50/tree/95a879f70a023fe3e097e9a33010b9e4eddccec5) remain in Git history.

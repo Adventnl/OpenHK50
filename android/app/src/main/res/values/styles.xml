@@ -1,9 +1,8 @@
 <resources>
     <string name="app_name">OpenHK50</string>
     <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">#F2F5EE</item>
-        <item name="android:colorAccent">#285239</item>
+        <item name="android:windowBackground">#F3F3F9</item>
+        <item name="android:colorAccent">#363CA2</item>
         <item name="android:windowActionModeOverlay">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
     </style>
 </resources>

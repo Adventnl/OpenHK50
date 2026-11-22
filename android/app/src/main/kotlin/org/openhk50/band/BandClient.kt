@@ -11,12 +11,15 @@ import android.os.Handler
 import android.os.Looper
 import org.openhk50.band.NativeProtocol.BATTERY
 import org.openhk50.band.NativeProtocol.HEART_HISTORY
-import org.openhk50.band.NativeProtocol.HEART_LIVE
 import org.openhk50.band.NativeProtocol.HEART_LOG
-import org.openhk50.band.NativeProtocol.HEART_STOP
+import org.openhk50.band.NativeProtocol.HRV_HISTORY
+import org.openhk50.band.NativeProtocol.LIVE
+import org.openhk50.band.NativeProtocol.LIVE_STOP
 import org.openhk50.band.NativeProtocol.STEPS
+import org.openhk50.band.NativeProtocol.STRESS_HISTORY
 import org.openhk50.data.Metric
 import org.openhk50.data.Reading
+import org.openhk50.data.SleepNight
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -29,6 +32,7 @@ enum class BandAction { IDLE, IMPORTING, MEASURING, SETTING }
 
 data class BandState(
     val device: BandDevice? = null,
+    val connecting: BandDevice? = null,
     val connection: Connection = Connection.DISCONNECTED,
     val action: BandAction = BandAction.IDLE,
     val scanning: Boolean = false,
@@ -36,30 +40,41 @@ data class BandState(
     val nearby: List<BandDevice> = emptyList(),
     val battery: Int? = null,
     val charging: Boolean = false,
-    val liveHeart: Int? = null,
+    val measurement: Metric? = null,
+    val liveValue: Int? = null,
+    val measurementMessage: String? = null,
+    val lastSync: Long? = null,
+    val detailSyncAvailable: Boolean = false,
+    val detailSyncEnabled: Boolean = false,
     val progress: Int = 0,
     val days: Int = 0,
     val message: String? = null
 )
 
 @SuppressLint("UnspecifiedRegisterReceiverFlag")
-internal class BandClient(context: Context, private val save: (List<Reading>) -> Unit) : GattLink.Events {
+internal class BandClient(
+    private val context: Context,
+    private val save: (List<Reading>) -> Unit,
+    private val saveSleep: (String, List<SleepNight>) -> Unit
+) : GattLink.Events {
     private val main = Handler(Looper.getMainLooper())
     private val prefs = context.getSharedPreferences("band", Context.MODE_PRIVATE)
     private val link = GattLink(context, main, this)
     private val refresh = Runnable { importHistory(false) }
-    private val reconnectJob = Runnable { reconnect() }
+    private val reconnectJob = Runnable { autoConnect() }
     private var foreground = false
     private var retryConnection = false
+    private var autoReconnect = prefs.getBoolean("autoReconnect", true)
     private var closingAfterMeasurement = false
     private var reopenAfterMeasurement = false
-    private var settingUp: BandDevice? = null
     private var exchange: Exchange? = null
+    private var detailTransfer: DetailTransfer? = null
     private var deadline: Runnable? = null
-    private var liveCount = 0
+    private val liveSamples = ArrayList<Int>(6)
     private var stopRequested = false
     private var historyReceived = false
     private var stepsReceived = false
+    private val unavailableHistory = mutableSetOf<Int>()
     private var bandZone = ZoneId.of(prefs.getString("zone", null) ?: ZoneId.systemDefault().id)
     val zone: ZoneId get() = if (state.device == null) ZoneId.systemDefault() else bandZone
 
@@ -87,7 +102,7 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
                             lost("Turn on Bluetooth and try again.")
                         }
                     }
-                    BluetoothAdapter.STATE_ON -> reconnect()
+                    BluetoothAdapter.STATE_ON -> autoConnect()
                 }
             }
         }
@@ -106,48 +121,70 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
         foreground = active
         if (active) {
             retryConnection = true
-            if (closingAfterMeasurement) reopenAfterMeasurement = true else reconnect()
+            if (closingAfterMeasurement) reopenAfterMeasurement = true else autoConnect()
         } else {
             link.stopScan()
-            disconnect()
+            endConnection()
         }
     }
 
     fun scan() {
+        if (!foreground || state.connection != Connection.DISCONNECTED) return
         main.removeCallbacks(reconnectJob)
         state = state.copy(message = null, nearby = emptyList())
         link.startScan()
     }
 
-    fun reconnect() {
-        if (foreground && state.connection == Connection.DISCONNECTED) state.device?.let(::connect)
+    fun stopScan() = link.stopScan()
+
+    fun reconnect() = state.device?.let(::connect)
+
+    private fun autoConnect() {
+        if (autoReconnect && !state.scanning && hasPermissions(context)) reconnect()
     }
 
     fun connect(device: BandDevice) {
-        if (!foreground || state.action == BandAction.MEASURING) return
+        if (!foreground || state.connection != Connection.DISCONNECTED) return
         main.removeCallbacks(reconnectJob)
         main.removeCallbacks(refresh)
         clearExchange()
-        settingUp = device
-        publish(state.copy(connection = Connection.CONNECTING, action = BandAction.IDLE, message = null,
-            battery = null, liveHeart = null))
+        unavailableHistory.clear()
+        publish(state.copy(connection = Connection.CONNECTING, connecting = device, action = BandAction.IDLE,
+            battery = null, charging = false, message = null, measurement = null, liveValue = null, measurementMessage = null))
         link.connect(device.address)
     }
 
     private fun closeLink(message: String?) {
         clearExchange()
+        detailTransfer?.cancel()
+        detailTransfer = null
         main.removeCallbacks(refresh)
         main.removeCallbacks(reconnectJob)
         link.close()
-        settingUp = null
         closingAfterMeasurement = false
         reopenAfterMeasurement = false
-        publish(state.copy(connection = Connection.DISCONNECTED, action = BandAction.IDLE, battery = null,
-            charging = false, liveHeart = null, message = message))
+        publish(state.copy(connection = Connection.DISCONNECTED, connecting = null, action = BandAction.IDLE,
+            battery = null, charging = false, liveValue = null, detailSyncAvailable = false, message = message))
     }
 
     fun disconnect() {
-        if (state.action == BandAction.MEASURING && state.connection == Connection.CONNECTED) {
+        autoReconnect = false
+        prefs.edit().putBoolean("autoReconnect", false).apply()
+        endConnection()
+    }
+
+    fun forget() {
+        if (state.connection != Connection.DISCONNECTED) return
+        val editor = prefs.edit().remove("address").remove("name").remove("zone").remove("autoReconnect")
+        state.device?.let { editor.remove(detailKey(it)) }
+        editor.apply()
+        autoReconnect = true
+        publish(state.copy(device = null, lastSync = null, measurement = null, measurementMessage = null,
+            detailSyncEnabled = false, message = null))
+    }
+
+    private fun endConnection() {
+        if (state.action == BandAction.MEASURING) {
             closingAfterMeasurement = true
             stopMeasurement()
         } else {
@@ -160,18 +197,22 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
 
     override fun scanFailed(message: String) = publish(state.copy(message = message, scanning = false))
 
-    override fun connected() {
-        val device = settingUp ?: return
-        if (state.device?.address != device.address) bandZone = ZoneId.systemDefault()
+    override fun connected(detailSyncAvailable: Boolean) {
+        val device = state.connecting ?: return
+        val sameBand = state.device?.address == device.address
+        if (!sameBand) bandZone = ZoneId.systemDefault()
+        autoReconnect = true
+        retryConnection = true
         prefs.edit().putString("address", device.address).putString("name", device.name)
-            .putString("zone", bandZone.id).apply()
-        settingUp = null
-        state = state.copy(device = device, connection = Connection.CONNECTED, message = null)
+            .putString("zone", bandZone.id).putBoolean("autoReconnect", true).apply()
+        state = state.copy(device = device, connecting = null, connection = Connection.CONNECTED,
+            lastSync = state.lastSync.takeIf { sameBand }, detailSyncAvailable = detailSyncAvailable,
+            detailSyncEnabled = detailSyncAvailable && prefs.contains(detailKey(device)), message = null)
         importHistory(false)
     }
 
     override fun lost(message: String) {
-        val retry = foreground && retryConnection && state.connection == Connection.CONNECTED
+        val retry = foreground && autoReconnect && retryConnection && state.connection == Connection.CONNECTED
         closeLink(message)
         if (retry) {
             retryConnection = false
@@ -197,12 +238,16 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
 
     private fun importDay(device: BandDevice, today: LocalDate, offset: Int) {
         if (offset >= state.days) {
-            finish(when {
+            if (historyReceived || stepsReceived) state = state.copy(lastSync = System.currentTimeMillis())
+            val message = when {
                 historyReceived && stepsReceived -> null
-                historyReceived -> "Step history didn’t reply. Try importing again."
-                stepsReceived -> "Heart-rate history didn’t reply. Try importing again."
-                else -> "No history reply. Try importing again."
-            })
+                historyReceived -> "Step history didn’t reply. Sync again."
+                stepsReceived -> "Heart-rate history didn’t reply. Sync again."
+                else -> "No history reply. Sync again."
+            }
+            val username = prefs.getString(detailKey(device), null)
+            if (state.detailSyncEnabled && username != null) startDetails(device, username, today, state.days, message)
+            else finish(message)
             return
         }
         publish(state.copy(progress = offset + 1))
@@ -212,17 +257,71 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
                 historyReceived = true
                 writeIntervals(device, Metric.HEART, day, NativeProtocol.intervals(heart.frames, null))
             }
-            if (today != LocalDate.now(zone)) {
-                finish("The day changed. Import again to update today.")
-            } else {
-                request(NativeProtocol.stepRequest(offset), 3_500) { steps ->
-                    if (!steps.rejected && steps.frames.isNotEmpty()) {
-                        stepsReceived = true
-                        writeIntervals(device, Metric.STEPS, day, NativeProtocol.intervals(steps.frames, day))
+            if (!sameDay(today)) return@request
+            request(NativeProtocol.stepRequest(offset), 3_500) stepsRequest@{ steps ->
+                if (!sameDay(today)) return@stepsRequest
+                if (!steps.rejected && steps.frames.isNotEmpty()) {
+                    stepsReceived = true
+                    writeIntervals(device, Metric.STEPS, day, NativeProtocol.intervals(steps.frames, day))
+                }
+                importSlots(device, today, offset, STRESS_HISTORY, Metric.STRESS) {
+                    importSlots(device, today, offset, HRV_HISTORY, Metric.HRV) {
+                        importDay(device, today, offset + 1)
                     }
-                    importDay(device, today, offset + 1)
                 }
             }
+        }
+    }
+
+    private fun detailKey(device: BandDevice) = "detailUser.${device.address}"
+
+    fun setDetailUsername(input: String?): Boolean {
+        val device = availableDevice()?.takeIf { state.detailSyncAvailable } ?: return false
+        val username = input?.trim()?.substringBefore('@')
+        if (username != null && (username.length !in 1..48 || username.any { it.isISOControl() || it.isWhitespace() })) {
+            return false
+        }
+        prefs.edit().putString(detailKey(device), username).apply()
+        publish(state.copy(detailSyncEnabled = username != null))
+        if (username != null) importHistory(false)
+        return true
+    }
+
+    private fun startDetails(device: BandDevice, username: String, today: LocalDate, days: Int, earlierIssue: String?) {
+        val transfer = DetailTransfer(main, link, today, days,
+            currentDay = { LocalDate.now(zone) },
+            sleep = { saveSleep(device.address, it) },
+            oxygen = { day, intervals -> writeIntervals(device, Metric.OXYGEN, day, intervals) }
+        ) { received, message ->
+            detailTransfer = null
+            if (received) state = state.copy(lastSync = System.currentTimeMillis())
+            finish(listOfNotNull(earlierIssue, message).joinToString(" ").ifEmpty { null })
+        }
+        detailTransfer = transfer
+        transfer.start(username)
+    }
+
+    override fun detailFrame(bytes: ByteArray) {
+        detailTransfer?.frame(bytes)
+    }
+
+    private fun sameDay(today: LocalDate): Boolean {
+        if (today == LocalDate.now(zone)) return true
+        finish("The day changed. Sync again.")
+        return false
+    }
+
+    private fun importSlots(device: BandDevice, today: LocalDate, offset: Int, command: Int,
+                            metric: Metric, done: () -> Unit) {
+        if (command in unavailableHistory) {
+            done()
+            return
+        }
+        request(NativeProtocol.packet(command, offset), 2_000) { result ->
+            if (!sameDay(today)) return@request
+            if (result.rejected || result.frames.isEmpty()) unavailableHistory += command
+            else writeIntervals(device, metric, today.minusDays(offset.toLong()), NativeProtocol.slotIntervals(result.frames))
+            done()
         }
     }
 
@@ -230,47 +329,61 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
         val now = System.currentTimeMillis()
         val readings = buildList {
             for (packed in intervals) {
-                Reading.history(device.address, metric, day, packed ushr 16, zone, packed and 65535, now)?.let(::add)
+                val value = packed and 65535
+                if (value in metric.intervalValues) {
+                    Reading.history(device.address, metric, day, packed ushr 16, zone, value, now)?.let(::add)
+                }
             }
         }
         if (readings.isNotEmpty()) save(readings)
     }
 
-    fun measure() {
+    fun measure(metric: Metric) {
         availableDevice() ?: return
+        val type = metric.liveType ?: return
         main.removeCallbacks(refresh)
-        liveCount = 0
+        liveSamples.clear()
         stopRequested = false
         closingAfterMeasurement = false
-        publish(state.copy(action = BandAction.MEASURING, liveHeart = null, message = null))
-        request(NativeProtocol.packet(HEART_LIVE, 1, 1), 30_000) { result ->
+        publish(state.copy(action = BandAction.MEASURING, measurement = metric, liveValue = null, measurementMessage = null))
+        request(NativeProtocol.packet(LIVE, type, 1), 30_000) { result ->
             val message = when {
-                result.rejected && liveCount == 0 -> "Band couldn’t measure. Adjust the strap and try again."
-                liveCount == 0 -> "No reading. Wear the band snugly and hold still."
+                result.rejected && liveSamples.isEmpty() -> "The band couldn’t measure. Check the fit and try again."
+                liveSamples.isEmpty() -> "No reading. Wear the band snugly and hold still."
                 else -> null
             }
-            stopOnBand(message)
+            stopOnBand(metric, type, message)
         }
     }
 
     fun stopMeasurement() {
         val current = exchange ?: return
-        if (current.command != HEART_LIVE) return
+        if (current.command != LIVE) return
+        val metric = state.measurement ?: return
+        val type = metric.liveType ?: return
         stopRequested = true
         if (current.written) {
             clearExchange()
-            stopOnBand(null)
+            stopOnBand(metric, type, null)
         }
     }
 
-    private fun stopOnBand(message: String?) {
-        request(NativeProtocol.packet(HEART_STOP, 1), 500) {
+    private fun stopOnBand(metric: Metric, type: Int, message: String?) {
+        val device = state.device
+        if (device != null && liveSamples.isNotEmpty()) {
+            liveSamples.sort()
+            val median = (liveSamples[(liveSamples.size - 1) / 2] + liveSamples[liveSamples.size / 2]) / 2
+            save(listOf(Reading.live(device.address, metric, median, Instant.now())))
+            liveSamples.clear()
+        }
+        request(NativeProtocol.packet(LIVE_STOP, type, 0, 0), 500) {
             if (!foreground || closingAfterMeasurement) {
                 val reopen = reopenAfterMeasurement
                 closeLink(null)
-                if (reopen) reconnect()
+                if (reopen) autoConnect()
             } else {
-                finish(message)
+                state = state.copy(liveValue = null, measurementMessage = message)
+                finish(state.message)
             }
         }
     }
@@ -318,7 +431,7 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
                 return@write
             }
             current.written = true
-            if (current.command == HEART_LIVE && stopRequested) stopMeasurement()
+            if (current.command == LIVE && stopRequested) stopMeasurement()
             else if (current.terminal) complete(current)
             else deadline = Runnable { complete(current) }.also { main.postDelayed(it, wait) }
         }
@@ -337,19 +450,18 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
                 current.terminal = true
             }
             current.command -> when (command) {
-                HEART_LIVE -> {
-                    if (sub != 1 || stopRequested) return
+                LIVE -> {
+                    val metric = state.measurement ?: return
+                    if (sub != metric.liveType || stopRequested) return
                     val error = header ushr 8 and 255
-                    val bpm = header and 255
+                    val value = header and 255
                     if (error != 0) {
                         current.rejected = true
                         current.terminal = true
-                    } else if (bpm in 1..254) {
-                        val device = state.device ?: return
-                        liveCount++
-                        save(listOf(Reading.live(device.address, bpm, Instant.now())))
-                        publish(state.copy(liveHeart = bpm))
-                        current.terminal = liveCount >= 6
+                    } else if (value in metric.intervalValues) {
+                        liveSamples += value
+                        publish(state.copy(liveValue = value))
+                        current.terminal = liveSamples.size >= 6
                     }
                 }
                 else -> {
@@ -357,7 +469,9 @@ internal class BandClient(context: Context, private val save: (List<Reading>) ->
                     if (current.frames.size < 120) current.frames.add(bytes)
                     current.terminal = when (command) {
                         HEART_HISTORY -> sub == 23 || sub == 255
-                        STEPS -> false
+                        STEPS -> sub == 255
+                        STRESS_HISTORY, HRV_HISTORY -> sub == 255 || current.frames.firstOrNull { it[1].toInt() == 0 }
+                            ?.let { (it[2].toInt() and 255) <= sub + 1 } == true
                         else -> true
                     }
                 }

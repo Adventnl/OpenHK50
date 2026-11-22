@@ -4,12 +4,9 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
@@ -18,6 +15,9 @@ import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
 import android.os.Handler
+import no.nordicsemi.android.ble.BleManager
+import no.nordicsemi.android.ble.callback.FailCallback
+import no.nordicsemi.android.ble.observer.ConnectionObserver
 import java.util.Locale
 import java.util.UUID
 
@@ -26,21 +26,19 @@ internal class GattLink(private val context: Context, private val main: Handler,
     interface Events {
         fun scanning(active: Boolean, candidates: List<BandDevice>)
         fun scanFailed(message: String)
-        fun connected()
+        fun connected(detailSyncAvailable: Boolean)
         fun lost(message: String)
         fun frame(bytes: ByteArray)
+        fun detailFrame(bytes: ByteArray)
     }
 
     private val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
-    private val candidates = linkedMapOf<String, BandDevice>()
+    private data class Candidate(val band: BandDevice, val device: BluetoothDevice, val modelName: Boolean)
+
+    private val candidates = linkedMapOf<String, Candidate>()
     private var scan: ScanCallback? = null
     private val scanDeadline = Runnable { stopScan() }
-    private val connectionDeadline = Runnable { fail("Connection timed out. Keep the band nearby and try again.") }
-    private val writeDeadline = Runnable { fail("Band stopped responding. Reconnect and try again.") }
-    private var gatt: BluetoothGatt? = null
-    private var tx: BluetoothGattCharacteristic? = null
-    private var writing: ((Boolean) -> Unit)? = null
-    private var ready = false
+    private var session: BandGatt? = null
 
     private fun unavailable(discovery: Boolean): String? = when {
         adapter == null -> "Bluetooth LE is unavailable on this phone."
@@ -71,14 +69,23 @@ internal class GattLink(private val context: Context, private val main: Handler,
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 main.post {
                     if (scan != this) return@post
-                    val record = result.scanRecord ?: return@post
-                    val name = record.deviceName
-                    if (record.serviceUuids?.any { it.uuid == SERVICE } != true
-                        && name?.uppercase(Locale.ROOT)?.startsWith("HK50") != true) return@post
+                    val record = result.scanRecord
+                    val name = record?.deviceName ?: runCatching { result.device.name }.getOrNull()
+                    val modelName = name?.uppercase(Locale.ROOT)?.let {
+                        it.startsWith("HK50") || it.startsWith("H59")
+                    } == true
+                    val advertisesService = record?.serviceUuids?.any { it.uuid == SERVICE } == true
+                    if (!modelName && !advertisesService) return@post
                     val address = result.device.address
-                    if (candidates.size < 20 && address !in candidates) {
-                        candidates[address] = BandDevice(name ?: "HK50", address)
-                        publishScan()
+                    val previous = candidates[address]
+                    val band = BandDevice(name ?: previous?.band?.name ?: "Nordic UART device", address)
+                    if (previous != null || candidates.size < 20 || modelName) {
+                        if (previous == null && candidates.size >= 20) {
+                            val other = candidates.entries.lastOrNull { !it.value.modelName } ?: return@post
+                            candidates.remove(other.key)
+                        }
+                        candidates[address] = Candidate(band, result.device, modelName || previous?.modelName == true)
+                        if (previous?.band != band) publishScan()
                     }
                 }
             }
@@ -105,7 +112,9 @@ internal class GattLink(private val context: Context, private val main: Handler,
         }
     }
 
-    private fun publishScan() = events.scanning(scan != null, candidates.values.sortedBy { it.name })
+    private fun publishScan() = events.scanning(scan != null, candidates.values
+        .sortedWith(compareByDescending<Candidate> { it.modelName }.thenBy { it.band.name })
+        .map { it.band })
 
     fun stopScan() {
         val callback = scan ?: return
@@ -120,26 +129,32 @@ internal class GattLink(private val context: Context, private val main: Handler,
         close()
         unavailable(false)?.let { events.lost(it); return }
         try {
-            gatt = adapter?.getRemoteDevice(address)?.connectGatt(context, false, callback,
-                BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, main)
-            if (gatt == null) fail("Couldn’t connect. Try again.")
-            else main.postDelayed(connectionDeadline, 14_000)
+            val device = candidates[address]?.device ?: checkNotNull(adapter).getRemoteDevice(address)
+            val next = BandGatt()
+            session = next
+            next.open(device)
         } catch (_: IllegalArgumentException) {
-            fail("Invalid band address. Scan for your band again.")
+            fail("Invalid band address. Scan again.")
         } catch (_: SecurityException) {
             fail("Allow Bluetooth access to connect.")
         }
     }
 
     fun close() {
-        main.removeCallbacks(connectionDeadline)
-        main.removeCallbacks(writeDeadline)
-        ready = false
-        tx = null
-        writing = null
-        val previous = gatt
-        gatt = null
-        runCatching { previous?.close() }
+        val previous = session ?: return
+        session = null
+        previous.setConnectionObserver(null)
+        val forceClose = Runnable { previous.close() }
+        main.postDelayed(forceClose, 5_000)
+        runCatching {
+            previous.disconnect().timeout(4_000).then {
+                main.removeCallbacks(forceClose)
+                forceClose.run()
+            }.enqueue()
+        }.onFailure {
+            main.removeCallbacks(forceClose)
+            forceClose.run()
+        }
     }
 
     private fun fail(message: String) {
@@ -148,109 +163,153 @@ internal class GattLink(private val context: Context, private val main: Handler,
     }
 
     fun write(packet: ByteArray, completion: (Boolean) -> Unit) {
-        val link = gatt
-        val characteristic = tx
-        if (!ready || writing != null || link == null || characteristic == null) {
-            completion(false)
-            return
-        }
-        val type = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        writing = completion
-        if (runCatching { writeCharacteristic(link, characteristic, packet, type) }.getOrDefault(false)) {
-            main.postDelayed(writeDeadline, 3_000)
-        } else {
-            finishWrite(false)
-        }
+        val current = session
+        if (current == null || !current.isReady) completion(false)
+        else current.sendUart(packet, completion)
     }
 
-    private fun finishWrite(ok: Boolean) {
-        main.removeCallbacks(writeDeadline)
-        val completion = writing
-        writing = null
-        completion?.invoke(ok)
-    }
+    fun prepareDetails(completion: (Boolean) -> Unit) =
+        session?.prepareDetails(completion) ?: completion(false)
 
-    private val callback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(link: BluetoothGatt, status: Int, state: Int) {
-            if (link != gatt) return
-            if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) {
-                fail("Band disconnected. Keep it nearby and try again.")
-            } else if (state == BluetoothProfile.STATE_CONNECTED
-                && !runCatching { link.discoverServices() }.getOrDefault(false)) {
-                fail("Couldn’t read band services. Reconnect and try again.")
+    fun writeDetail(packet: ByteArray, completion: (Boolean) -> Unit) =
+        session?.sendDetail(packet, completion) ?: completion(false)
+
+    private inner class BandGatt : BleManager(context, main), ConnectionObserver {
+        private var tx: BluetoothGattCharacteristic? = null
+        private var rx: BluetoothGattCharacteristic? = null
+        private var detailTx: BluetoothGattCharacteristic? = null
+        private var detailRx: BluetoothGattCharacteristic? = null
+        private var subscribed = false
+        private var detailSubscribed = false
+        private var connected = false
+
+        fun open(device: BluetoothDevice) {
+            setConnectionObserver(this)
+            connect(device)
+                .retry(2, 350)
+                .timeout(20_000)
+                .done {
+                    if (session == this) {
+                        if (subscribed) {
+                            connected = true
+                            events.connected(detailTx != null && detailRx != null)
+                        } else {
+                            fail("Couldn’t turn on band updates. Reconnect and try again.")
+                        }
+                    }
+                }
+                .fail { _, status ->
+                    if (session == this) fail(when (status) {
+                        FailCallback.REASON_DEVICE_NOT_SUPPORTED -> "The device doesn’t expose the HK50/H59 service."
+                        FailCallback.REASON_TIMEOUT -> "Connection timed out. Keep the band nearby and try again."
+                        FailCallback.REASON_BLUETOOTH_DISABLED -> "Turn on Bluetooth and try again."
+                        else -> "Couldn’t connect. Disconnect the band from other apps and try again."
+                    })
+                }
+                .enqueue()
+        }
+
+        override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
+            val service = gatt.getService(SERVICE) ?: return false
+            tx = service.getCharacteristic(WRITE)?.takeIf(::writable) ?: return false
+            rx = service.getCharacteristic(NOTIFY)?.takeIf(::notifiable) ?: return false
+            val details = gatt.services.firstOrNull {
+                it.getCharacteristic(DETAIL_WRITE)?.let(::writable) == true &&
+                    it.getCharacteristic(DETAIL_NOTIFY)?.let(::notifiable) == true
+            }
+            detailTx = details?.getCharacteristic(DETAIL_WRITE)
+            detailRx = details?.getCharacteristic(DETAIL_NOTIFY)
+            return true
+        }
+
+        override fun initialize() {
+            val incoming = rx ?: return
+            subscribe(incoming, events::frame) { subscribed = it }
+        }
+
+        fun prepareDetails(completion: (Boolean) -> Unit) {
+            val incoming = detailRx
+            if (!connected || incoming == null) {
+                completion(false)
+            } else if (detailSubscribed) {
+                completion(true)
+            } else {
+                requestMtu(247).enqueue()
+                subscribe(incoming, events::detailFrame) {
+                    detailSubscribed = it
+                    completion(it)
+                }
             }
         }
 
-        override fun onServicesDiscovered(link: BluetoothGatt, status: Int) {
-            if (link != gatt) return
-            val service = link.getService(SERVICE)
-            val write = service?.getCharacteristic(WRITE)
-            val notify = service?.getCharacteristic(NOTIFY)
-            val descriptor = notify?.getDescriptor(CCCD)
-            val writeFlags = BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
-            val notifyFlags = BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE
-            if (status != BluetoothGatt.GATT_SUCCESS || write == null || notify == null || descriptor == null
-                || write.properties and writeFlags == 0 || notify.properties and notifyFlags == 0) {
-                fail("This device doesn’t expose the HK50 service.")
+        private fun subscribe(incoming: BluetoothGattCharacteristic, received: (ByteArray) -> Unit,
+                              completion: (Boolean) -> Unit) {
+            val notifications = incoming.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+            val callback = if (notifications) setNotificationCallback(incoming) else setIndicationCallback(incoming)
+            callback.with { _, data -> if (session == this && connected) data.value?.let(received) }
+            val request = if (notifications) enableNotifications(incoming) else enableIndications(incoming)
+            request.timeout(5_000)
+                .done { if (session == this) completion(true) }
+                .fail { _, _ -> if (session == this) completion(false) }
+                .invalid { if (session == this) completion(false) }
+                .enqueue()
+        }
+
+        override fun onServicesInvalidated() {
+            subscribed = false
+            detailSubscribed = false
+            tx = null
+            rx = null
+            detailTx = null
+            detailRx = null
+        }
+
+        fun sendUart(packet: ByteArray, completion: (Boolean) -> Unit) = send(tx, packet, completion)
+
+        fun sendDetail(packet: ByteArray, completion: (Boolean) -> Unit) {
+            if (!detailSubscribed || packet.size > getMtu() - 3) completion(false)
+            else send(detailTx, packet, completion)
+        }
+
+        private fun send(outgoing: BluetoothGattCharacteristic?, packet: ByteArray, completion: (Boolean) -> Unit) {
+            if (outgoing == null) {
+                completion(false)
                 return
             }
-            tx = write
-            val enable = if (notify.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-            val subscribed = runCatching {
-                link.setCharacteristicNotification(notify, true) && writeDescriptor(link, descriptor, enable)
-            }.getOrDefault(false)
-            if (!subscribed) fail("Couldn’t subscribe to band updates. Reconnect and try again.")
+            val type = if (outgoing.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            writeCharacteristic(outgoing, packet, type).timeout(4_000)
+                .done { if (session == this) completion(true) }
+                .fail { _, _ -> if (session == this) completion(false) }
+                .invalid { if (session == this) completion(false) }
+                .enqueue()
         }
 
-        override fun onDescriptorWrite(link: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            if (link != gatt || descriptor.uuid != CCCD) return
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                fail("Band rejected Bluetooth notifications. Reconnect and try again.")
-                return
-            }
-            main.removeCallbacks(connectionDeadline)
-            ready = true
-            events.connected()
-        }
-
-        override fun onCharacteristicWrite(link: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (link == gatt && characteristic.uuid == WRITE) finishWrite(status == BluetoothGatt.GATT_SUCCESS)
-        }
-
-        override fun onCharacteristicChanged(link: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            if (link == gatt && ready && characteristic.uuid == NOTIFY) events.frame(value)
-        }
-
-        @Suppress("DEPRECATION")
-        @Deprecated("Required on Android 12 and earlier")
-        override fun onCharacteristicChanged(link: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (Build.VERSION.SDK_INT < 33) characteristic.value?.clone()?.let {
-                onCharacteristicChanged(link, characteristic, it)
-            }
+        override fun onDeviceConnecting(device: BluetoothDevice) = Unit
+        override fun onDeviceConnected(device: BluetoothDevice) = Unit
+        override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) = Unit
+        override fun onDeviceReady(device: BluetoothDevice) = Unit
+        override fun onDeviceDisconnecting(device: BluetoothDevice) = Unit
+        override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+            if (session == this && connected) fail("Band disconnected. Keep it nearby and try again.")
         }
     }
-
-    @Suppress("DEPRECATION")
-    private fun writeCharacteristic(link: BluetoothGatt, target: BluetoothGattCharacteristic, bytes: ByteArray, type: Int): Boolean {
-        if (Build.VERSION.SDK_INT >= 33) {
-            return link.writeCharacteristic(target, bytes, type) == BluetoothStatusCodes.SUCCESS
-        }
-        target.writeType = type
-        return target.setValue(bytes) && link.writeCharacteristic(target)
-    }
-
-    @Suppress("DEPRECATION")
-    private fun writeDescriptor(link: BluetoothGatt, descriptor: BluetoothGattDescriptor, bytes: ByteArray): Boolean =
-        if (Build.VERSION.SDK_INT >= 33) link.writeDescriptor(descriptor, bytes) == BluetoothStatusCodes.SUCCESS
-        else descriptor.setValue(bytes) && link.writeDescriptor(descriptor)
 
     companion object {
         private val SERVICE = UUID.fromString("6e40fff0-b5a3-f393-e0a9-e50e24dcca9e")
         private val WRITE = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
         private val NOTIFY = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
         private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private val DETAIL_WRITE = UUID.fromString("de5bf72a-d711-4e47-af26-65e3012a5dc7")
+        private val DETAIL_NOTIFY = UUID.fromString("de5bf729-d711-4e47-af26-65e3012a5dc7")
+
+        private fun writable(value: BluetoothGattCharacteristic): Boolean =
+            value.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+
+        private fun notifiable(value: BluetoothGattCharacteristic): Boolean =
+            value.getDescriptor(CCCD) != null && value.properties and
+                (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
 
         fun permissions() = if (Build.VERSION.SDK_INT >= 31)
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)

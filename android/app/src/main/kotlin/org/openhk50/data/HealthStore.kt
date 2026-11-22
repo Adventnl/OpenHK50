@@ -7,12 +7,18 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.time.LocalDate
 import java.time.ZoneId
 
-class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 1) {
+class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 2) {
     data class Day(
-        val heart: List<Reading>, val steps: List<Reading>, val latestHeart: Reading?,
-        val band: String?, val earlier: Boolean
+        private val readings: Map<Metric, List<Reading>>, val sleep: SleepNight?, val earlier: Boolean
     ) {
-        val stepTotal = steps.sumOf { it.value.toLong() }
+        fun readings(metric: Metric) = readings[metric].orEmpty()
+
+        fun value(metric: Metric): Long? {
+            val samples = readings(metric)
+            if (samples.isEmpty()) return null
+            return if (metric == Metric.STEPS) samples.sumOf { it.value.toLong() }
+            else samples.last().value.toLong()
+        }
     }
     data class Checkpoint(val store: String, val cursor: Long)
 
@@ -35,29 +41,63 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
             CREATE TABLE backup (id INTEGER PRIMARY KEY CHECK(id=1),
                 scope TEXT NOT NULL, store TEXT NOT NULL, cursor INTEGER NOT NULL)
         """.trimIndent())
+        createSleepTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        error("Missing database migration from $oldVersion to $newVersion")
+        if (oldVersion == 1 && newVersion == 2) createSleepTable(db)
+        else error("Missing database migration from $oldVersion to $newVersion")
     }
+
+    private fun createSleepTable(db: SQLiteDatabase) = db.execSQL("""
+        CREATE TABLE sleep_nights (
+            band TEXT NOT NULL, day TEXT NOT NULL, start_minute INTEGER NOT NULL, segments BLOB NOT NULL,
+            PRIMARY KEY (band, day)
+        ) WITHOUT ROWID
+    """.trimIndent())
 
     fun save(readings: List<Reading>) {
         if (readings.isNotEmpty()) transaction { db -> readings.forEach { upsert(db, it, true) } }
+    }
+
+    fun saveSleep(band: String, nights: List<SleepNight>) = transaction { db ->
+        for (night in nights) {
+            val segments = night.segments.flatMap { listOf(it.stage.ordinal.toByte(), it.minutes.toByte()) }.toByteArray()
+            db.insertWithOnConflict("sleep_nights", null, ContentValues(4).apply {
+                put("band", band)
+                put("day", night.day.toString())
+                put("start_minute", night.startMinute)
+                put("segments", segments)
+            }, SQLiteDatabase.CONFLICT_REPLACE)
+        }
     }
 
     fun day(selected: String?, date: LocalDate, zone: ZoneId): Day {
         val db = readableDatabase
         val band = selected ?: db.rawQuery("SELECT band FROM readings ORDER BY time_ms DESC LIMIT 1", null)
             .use { if (it.moveToFirst()) it.getString(0) else null }
-        if (band == null) return Day(emptyList(), emptyList(), null, null, false)
+            ?: db.rawQuery("SELECT band FROM sleep_nights ORDER BY day DESC LIMIT 1", null)
+                .use { if (it.moveToFirst()) it.getString(0) else null }
+        if (band == null) return Day(emptyMap(), null, false)
         val start = date.atStartOfDay(zone).toInstant().toEpochMilli().toString()
         val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli().toString()
         val rows = read(db, "band=? AND time_ms>=? AND time_ms<?", arrayOf(band, start, end), "time_ms ASC")
-        val latest = rows.lastOrNull { it.metric == Metric.HEART }
-            ?: read(db, "band=? AND kind='HEART' AND time_ms<?", arrayOf(band, start), "time_ms DESC", "1").firstOrNull()
-        val earlier = db.rawQuery("SELECT 1 FROM readings WHERE band=? AND time_ms<? LIMIT 1", arrayOf(band, start))
+        val earlier = db.rawQuery("""
+            SELECT 1 FROM readings WHERE band=? AND time_ms<?
+            UNION ALL SELECT 1 FROM sleep_nights WHERE band=? AND day<? LIMIT 1
+        """.trimIndent(), arrayOf(band, start, band, date.toString()))
             .use { it.moveToFirst() }
-        return Day(rows.filter { it.metric == Metric.HEART }, rows.filter { it.metric == Metric.STEPS }, latest, band, earlier)
+        val sleep = db.rawQuery("SELECT start_minute, segments FROM sleep_nights WHERE band=? AND day=?",
+            arrayOf(band, date.toString())).use { cursor ->
+            if (!cursor.moveToFirst()) null else {
+                val bytes = cursor.getBlob(1)
+                val segments = (0 until bytes.lastIndex step 2).map { i ->
+                    SleepSegment(SleepStage.entries[bytes[i].toInt()], bytes[i + 1].toInt() and 255)
+                }
+                SleepNight(date, cursor.getInt(0), segments)
+            }
+        }
+        return Day(rows.groupBy { it.metric }, sleep, earlier)
     }
 
     fun pendingCount(): Long = readableDatabase.rawQuery("SELECT count(*) FROM readings WHERE pending=1", null)
@@ -71,7 +111,7 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
     ).use { if (it.moveToFirst()) Checkpoint(it.getString(0), it.getLong(1)) else null }
 
     fun resetBackup(scope: String, store: String) = transaction { db ->
-        db.execSQL("UPDATE readings SET pending=1 WHERE pending=0")
+        db.execSQL("UPDATE readings SET pending=1 WHERE pending=0 AND kind IN ('HEART','STEPS')")
         writeCheckpoint(db, scope, store, 0)
     }
 
@@ -94,7 +134,7 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
             put("value", reading.value)
             put("revised_at", reading.revisedAt)
             put("revision", reading.revision)
-            put("pending", if (pending) 1 else 0)
+            put("pending", if (pending && reading.metric.backedUp) 1 else 0)
         }
         if (db.insertWithOnConflict("readings", null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1L) return
         val whenNewer = "$KEY AND (revised_at < ? OR (revised_at = ? AND revision < ?))"

@@ -11,6 +11,7 @@
     <application
         android:name=".OpenHkApp"
         android:allowBackup="false"
+        android:fullBackupContent="false"
         android:dataExtractionRules="@xml/backup_rules"
         android:enableOnBackInvokedCallback="true"
         android:usesCleartextTraffic="false"

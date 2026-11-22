@@ -7,7 +7,15 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 
-enum class Metric { HEART, STEPS }
+enum class Metric(val intervalValues: IntRange, val liveType: Int? = null) {
+    HEART(1..254, 1),
+    STEPS(0..65534),
+    OXYGEN(1..100, 3),
+    STRESS(1..100, 8),
+    HRV(1..254);
+
+    val backedUp get() = this == HEART || this == STEPS
+}
 enum class Origin { HISTORY, LIVE }
 
 data class Reading(
@@ -25,9 +33,9 @@ data class Reading(
         require(time in 1 until MAX_TIME && revisedAt in time until MAX_TIME)
         require(when (origin) {
             Origin.HISTORY -> SLOT.matches(slot)
-            Origin.LIVE -> slot == revision && metric == Metric.HEART && time == revisedAt
+            Origin.LIVE -> slot == revision && metric.liveType != null && time == revisedAt
         })
-        require(value in if (metric == Metric.HEART) 1..254 else 0..65534)
+        require(value in metric.intervalValues)
     }
 
     companion object {
@@ -49,10 +57,10 @@ data class Reading(
             return Reading(band, metric, Origin.HISTORY, slot, time, value, observedAt, revision())
         }
 
-        fun live(band: String, bpm: Int, observedAt: Instant): Reading {
+        fun live(band: String, metric: Metric, value: Int, observedAt: Instant): Reading {
             val id = revision()
             val time = observedAt.toEpochMilli()
-            return Reading(band, Metric.HEART, Origin.LIVE, id, time, bpm, time, id)
+            return Reading(band, metric, Origin.LIVE, id, time, value, time, id)
         }
 
         private fun revision() = UUID.randomUUID().toString().replace("-", "")

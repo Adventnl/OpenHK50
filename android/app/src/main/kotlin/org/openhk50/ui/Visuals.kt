@@ -13,6 +13,8 @@ import android.content.res.ColorStateList
 import android.view.View
 import org.openhk50.data.Metric
 import org.openhk50.data.Reading
+import org.openhk50.data.SleepSegment
+import org.openhk50.data.SleepStage
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.ceil
@@ -21,22 +23,69 @@ import kotlin.math.roundToInt
 
 internal data class Palette(
     val background: Int, val surface: Int, val ink: Int, val muted: Int, val border: Int,
-    val brand: Int, val onBrand: Int, val tint: Int, val heart: Int, val steps: Int, val warning: Int,
+    val brand: Int, val onBrand: Int, val tint: Int, val heart: Int, val steps: Int,
+    val oxygen: Int, val stress: Int, val hrv: Int, val warning: Int,
     val night: Boolean
 ) {
     companion object {
         fun of(night: Boolean) = if (night) Palette(
-            color("#121915"), color("#1A241E"), color("#EDF4EB"), color("#A8B8AB"), color("#34453A"),
-            color("#B9E6C7"), color("#142A1D"), color("#263E30"), color("#A6E5B7"), color("#F0BA89"),
-            color("#F4AD9E"), true
+            color("#15151D"), color("#20212C"), color("#F4F3FC"), color("#B2B2C6"), color("#363849"),
+            color("#BABDFF"), color("#1D2050"), color("#2A2D4D"), color("#FF92AB"), color("#FFBE83"),
+            color("#8ADCED"), color("#E2AAF4"), color("#A4DABB"), color("#FFAA9E"), true
         ) else Palette(
-            color("#F2F5EE"), color("#FCFDF8"), color("#18261E"), color("#4E6254"), color("#D7E2D7"),
-            color("#285239"), Color.WHITE, color("#DCECDC"), color("#317044"), color("#9E5528"),
-            color("#973C2E"), false
+            color("#F3F3F9"), Color.WHITE, color("#181923"), color("#595D70"), color("#E0E1EC"),
+            color("#363CA2"), Color.WHITE, color("#E8E9FF"), color("#A92450"), color("#925016"),
+            color("#146A7C"), color("#802B88"), color("#28684C"), color("#9D363A"), false
         )
 
         private fun color(hex: String) = Color.parseColor(hex)
     }
+}
+
+internal fun Palette.accent(metric: Metric) = when (metric) {
+    Metric.HEART -> heart
+    Metric.STEPS -> steps
+    Metric.OXYGEN -> oxygen
+    Metric.STRESS -> stress
+    Metric.HRV -> hrv
+}
+
+internal val Metric.title get() = when (this) {
+    Metric.HEART -> "Heart rate"
+    Metric.STEPS -> "Steps"
+    Metric.OXYGEN -> "Blood oxygen"
+    Metric.STRESS -> "Stress"
+    Metric.HRV -> "Heart rate variability"
+}
+
+internal val Metric.unit get() = when (this) {
+    Metric.HEART -> "bpm"
+    Metric.STEPS -> "steps"
+    Metric.OXYGEN -> "%"
+    Metric.STRESS -> ""
+    Metric.HRV -> "ms"
+}
+
+internal val Metric.icon get() = when (this) {
+    Metric.HEART -> Glyph.PULSE
+    Metric.STEPS -> Glyph.WALK
+    Metric.OXYGEN -> Glyph.DROP
+    Metric.STRESS -> Glyph.WAVE
+    Metric.HRV -> Glyph.VARIABILITY
+}
+
+internal val SleepStage.title get() = when (this) {
+    SleepStage.LIGHT -> "Light"
+    SleepStage.DEEP -> "Deep"
+    SleepStage.REM -> "REM"
+    SleepStage.AWAKE -> "Awake"
+}
+
+internal fun Palette.sleepColor(stage: SleepStage) = when (stage) {
+    SleepStage.LIGHT -> Color.parseColor(if (night) "#8088E4" else "#727BD1")
+    SleepStage.DEEP -> Color.parseColor(if (night) "#B5A5FF" else "#493399")
+    SleepStage.REM -> Color.parseColor(if (night) "#75D7DC" else "#24929A")
+    SleepStage.AWAKE -> Color.parseColor(if (night) "#FFB192" else "#C4684D")
 }
 
 internal fun Context.dp(value: Number) = (value.toFloat() * resources.displayMetrics.density).roundToInt()
@@ -53,7 +102,8 @@ internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = 
 )
 
 internal enum class Glyph {
-    PULSE, CALENDAR, BAND, BACKUP, WALK, BATTERY, LEFT, RIGHT, BLUETOOTH, CHECK, CLOCK
+    PULSE, CALENDAR, BAND, BACKUP, WALK, BATTERY, LEFT, RIGHT, DOWN, BLUETOOTH, CHECK, CLOCK,
+    DROP, WAVE, VARIABILITY, SCAN, MOON
 }
 
 internal class Icon(context: Context, private val glyph: Glyph, private val color: Int) : View(context) {
@@ -118,14 +168,69 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
             }
             Glyph.LEFT -> path(14f, 5f, 7f, 12f, 14f, 19f)
             Glyph.RIGHT -> path(10f, 5f, 17f, 12f, 10f, 19f)
+            Glyph.DOWN -> path(5f, 9f, 12f, 16f, 19f, 9f)
             Glyph.BLUETOOTH -> path(6f, 7f, 18f, 17f, 12f, 22f, 12f, 2f, 18f, 7f, 6f, 17f)
             Glyph.CHECK -> path(5f, 12f, 10f, 17f, 19f, 7f)
             Glyph.CLOCK -> {
                 canvas.drawCircle(12f, 12f, 8.5f, paint)
                 path(12f, 7f, 12f, 12f, 16f, 14f)
             }
+            Glyph.DROP -> {
+                lines.reset()
+                lines.moveTo(12f, 3f)
+                lines.cubicTo(10f, 7f, 6f, 10f, 6f, 14f)
+                lines.cubicTo(6f, 22f, 18f, 22f, 18f, 14f)
+                lines.cubicTo(18f, 10f, 14f, 7f, 12f, 3f)
+                canvas.drawPath(lines, paint)
+            }
+            Glyph.WAVE -> {
+                lines.reset()
+                lines.moveTo(3f, 12f)
+                lines.cubicTo(6f, 4f, 9f, 4f, 12f, 12f)
+                lines.cubicTo(15f, 20f, 18f, 20f, 21f, 12f)
+                canvas.drawPath(lines, paint)
+            }
+            Glyph.VARIABILITY -> {
+                path(6f, 11f, 6f, 18f)
+                path(12f, 5f, 12f, 18f)
+                path(18f, 8f, 18f, 18f)
+            }
+            Glyph.SCAN -> {
+                path(8f, 4f, 4f, 4f, 4f, 8f)
+                path(16f, 4f, 20f, 4f, 20f, 8f)
+                path(20f, 16f, 20f, 20f, 16f, 20f)
+                path(8f, 20f, 4f, 20f, 4f, 16f)
+                canvas.drawCircle(12f, 12f, 3f, paint)
+            }
+            Glyph.MOON -> {
+                lines.reset()
+                lines.moveTo(12f, 3.5f)
+                lines.cubicTo(5f, 4f, 2f, 11.5f, 6f, 17f)
+                lines.cubicTo(10f, 22.5f, 19f, 21f, 21f, 14f)
+                lines.cubicTo(14f, 17f, 9.5f, 11f, 12f, 3.5f)
+                canvas.drawPath(lines, paint)
+            }
         }
         canvas.restore()
+    }
+}
+
+internal class SleepTimeline(context: Context, palette: Palette, segments: List<SleepSegment>) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val cuts = segments.map { it.minutes to palette.sleepColor(it.stage) }
+    private val total = cuts.sumOf { it.first }
+
+    init { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+
+    override fun onDraw(canvas: Canvas) {
+        if (total == 0) return
+        var minutes = 0
+        for ((duration, color) in cuts) {
+            val begin = minutes.toFloat() / total * width
+            minutes += duration
+            paint.color = color
+            canvas.drawRect(begin, 0f, minutes.toFloat() / total * width, height.toFloat(), paint)
+        }
     }
 }
 
@@ -144,7 +249,7 @@ internal class SeriesChart(
         else maxOf(low + 20, (ceil((readings.maxOf { it.value } + 5) / 10.0) * 10).toInt())
 
     init {
-        val name = if (metric == Metric.HEART) "Heart rate in beats per minute" else "Steps per 15 minutes"
+        val name = if (metric == Metric.STEPS) "Steps per 15 minutes" else "${metric.title} ${metric.unit}".trimEnd()
         contentDescription = "$name, ${readings.size} readings. Low ${readings.minOf { it.value }}, high ${readings.maxOf { it.value }}."
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
     }
@@ -180,8 +285,8 @@ internal class SeriesChart(
             canvas.drawText(label, center, height - 5f * density, paint)
         }
 
-        if (metric == Metric.HEART) {
-            paint.color = palette.heart
+        if (metric != Metric.STEPS) {
+            paint.color = palette.accent(metric)
             paint.style = Paint.Style.STROKE
             paint.strokeJoin = Paint.Join.ROUND
             paint.strokeCap = Paint.Cap.ROUND
@@ -190,7 +295,8 @@ internal class SeriesChart(
             var previous: Reading? = null
             for (reading in readings) {
                 val last = previous
-                if (last == null || reading.time - last.time > 10 * 60_000) path.moveTo(x(reading.time), y(reading.value))
+                val gap = if (metric == Metric.HEART) 10 else 35
+                if (last == null || reading.time - last.time > gap * 60_000) path.moveTo(x(reading.time), y(reading.value))
                 else path.lineTo(x(reading.time), y(reading.value))
                 previous = reading
             }

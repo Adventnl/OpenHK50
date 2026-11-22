@@ -22,16 +22,19 @@ class OpenHkApp : Application() {
         private set
 
     internal val band by lazy {
-        BandClient(this) { readings ->
-            databaseThread.execute {
-                try {
-                    health.save(readings)
-                    storageIssue = null
-                } catch (_: SQLiteException) {
-                    storageIssue = "Couldn’t save readings. Check phone storage and import again."
-                }
-                notifyChanged()
+        BandClient(this, { readings -> write { health.save(readings) } },
+            { band, nights -> write { health.saveSleep(band, nights) } })
+    }
+
+    private fun write(save: () -> Unit) {
+        databaseThread.execute {
+            try {
+                save()
+                storageIssue = null
+            } catch (_: SQLiteException) {
+                storageIssue = "Couldn’t save readings. Check phone storage and sync again."
             }
+            notifyChanged()
         }
     }
 
