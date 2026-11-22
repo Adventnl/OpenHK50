@@ -34,6 +34,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.core.content.edit
 import androidx.core.graphics.ColorUtils
+import org.openhk50.BuildConfig
 import org.openhk50.OpenHkApp
 import org.openhk50.band.BandAction
 import org.openhk50.band.BandClient
@@ -47,6 +48,7 @@ import org.openhk50.data.HistoryPeriod
 import org.openhk50.data.SleepNight
 import org.openhk50.data.SleepStage
 import org.openhk50.data.Workout
+import org.openhk50.data.WorkoutEnergyProfile
 import org.openhk50.data.WorkoutLog
 import org.openhk50.data.WorkoutType
 import org.openhk50.data.combined
@@ -92,6 +94,10 @@ class MainActivity : ComponentActivity() {
     private var workoutBusy = false
     private var workoutPage = 0
     private var workoutTimer: TextView? = null
+    private var workoutCalories: TextView? = null
+    private val workoutEnergyProfile = BuildConfig.WORKOUT_WEIGHT_KG?.let { weight ->
+        BuildConfig.WORKOUT_BODY_FAT_PERCENT?.let { bodyFat -> WorkoutEnergyProfile(weight, bodyFat) }
+    }
     private var camera: BandCamera? = null
     private var cameraPermissionPending = false
     private var resumed = false
@@ -458,6 +464,7 @@ class MainActivity : ComponentActivity() {
     private fun drawScreen(keepScroll: Boolean = false) {
         app.main.removeCallbacks(tickWorkout)
         workoutTimer = null
+        workoutCalories = null
         if (tab == Tab.CAMERA) {
             scroll = null
             if (camera == null) cameraScreen()
@@ -717,6 +724,7 @@ class MainActivity : ComponentActivity() {
             val date = Instant.ofEpochMilli(record.start).atZone(band.zone).toLocalDate()
             val heart = record.averageHeartRate?.let { " · $it bpm avg" }.orEmpty()
             note(identity, date.format(MONTH_DAY) + heart, 3)
+            workoutCaloriesText(record, 0)?.let { note(identity, it, 3) }
             line.addView(identity, lp(0, -2, 1f).apply { marginStart = dp(10) })
             line.addView(label(sessionDuration(record), 15, palette.workout, "sans-serif-medium"),
                 lp(-2, -2).apply { marginStart = dp(8) })
@@ -769,9 +777,12 @@ class MainActivity : ComponentActivity() {
             lp(0, -2, 1f).apply { marginStart = dp(10) })
         header.addView(label(if (paused) "Paused" else "In progress", 13, palette.workout))
         block(recorder, header, 0)
-        workoutTimer = readout("", size = 38)
-        block(recorder, requireNotNull(workoutTimer), 8)
-        updateWorkoutTimer(workout)
+        val now = System.currentTimeMillis()
+        workoutTimer = readout(workoutDuration(workout.seconds(now)), size = 38)
+            .also { block(recorder, it, 8) }
+        workoutCalories = workoutCaloriesText(workout, now)?.let { text ->
+            label(text, 14, palette.muted).also { block(recorder, it, 4) }
+        }
         if (active && !paused) app.main.postDelayed(tickWorkout, 1_000)
         val controls = row()
         controls.addView(button(if (paused) "Resume" else "Pause", filled = true, enabled = !workoutBusy) {
@@ -803,11 +814,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateWorkoutTimer(workout: Workout) {
-        workoutTimer?.text = workoutDuration(workout)
+        val now = System.currentTimeMillis()
+        workoutTimer?.text = workoutDuration(workout.seconds(now))
+        workoutCalories?.text = workoutCaloriesText(workout, now)
     }
 
-    private fun workoutDuration(workout: Workout): String {
-        val elapsed = workout.seconds(System.currentTimeMillis())
+    private fun workoutCaloriesText(workout: Workout, now: Long): String? =
+        workout.estimatedActiveKcal(workoutEnergyProfile, now)?.let { "${number(it)} active kcal est." }
+
+    private fun workoutDuration(elapsed: Long): String {
         return String.format(java.util.Locale.getDefault(), "%02d:%02d:%02d", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
     }
 
