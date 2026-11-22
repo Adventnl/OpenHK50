@@ -1,8 +1,26 @@
 # OpenHK50
 
-OpenHK50 is an Android companion for HK50 and H59 bands. It uses Nordic’s Android BLE library to connect directly to the band. Today and History show readings stored on the phone, with optional home-server backup for heart rate and steps.
+OpenHK50 connects to HK50 and H59 bands from Android or a Mac. Each client stores its readings locally and can back up heart rate and steps to the Rust sync service.
 
-## Build and run
+## Run on a Mac
+
+With Rust stable installed, run this from the repository root in Terminal:
+
+```sh
+./desktop/run
+```
+
+The command opens the dashboard at [127.0.0.1:8746](http://127.0.0.1:8746). On the first scan, allow **Terminal** in **System Settings → Privacy & Security → Bluetooth**. Disconnect QWatch Pro, OpenHK50 for Android, or any other app currently using the band. Then click **Scan for bands** and choose your device. Keep Terminal running to sync while the browser tab is closed. Press Ctrl+C in Terminal to stop.
+
+**Measure** requests a spot reading. With **Auto-sync** enabled, the Mac reads band history when you connect and about every five minutes while connected. **Band controls** offers a seven-day import, clock setting, and band heart-rate logging. Use the date picker to see past days. Today rolls over at midnight in the Mac’s time zone. Keep the Mac and band clocks in the same time zone.
+
+**Start workout** estimates calories from activity, weight, and elapsed time. Use **End workout** to save it. Sessions survive browser and service restarts, and history files them under their start date. **Band calories** comes directly from the band’s activity intervals. The workout estimate is separate.
+
+**Settings** controls auto-sync, workouts, notification tests, and extra health metrics. Supported bands can sync sleep and hourly oxygen history after you enter the linked QWatch username. **Simulate Android notification** shows a test in the browser. **Send band alert** appears if the device exposes Bluetooth Immediate Alert. The Mac client has no WeChat notification integration.
+
+Records live in `~/Library/Application Support/OpenHK50/health.sqlite3`. See [Mac backup setup](desktop/README.md) for the optional server connection.
+
+## Build and run on Android
 
 Install JDK 17, the Android SDK command-line tools, Rust stable, and the Android Rust targets. Set `JAVA_HOME` and `ANDROID_HOME` to your installations. From the repository root:
 
@@ -50,6 +68,7 @@ In **Backup → Set up backup**, enter the HTTPS origin and the key from `/etc/o
 ## Source layout
 
 - `android/` Kotlin app, Nordic BLE, SQLite, UI, and scheduled backup.
+- `desktop/` Rust macOS Bluetooth service, SQLite store, and browser dashboard. Android does not build or package it.
 - `protocol/` Rust BLE codec with a thin Android JNI binding. Run its checks with `cargo test --locked --manifest-path protocol/Cargo.toml`.
 - `server/` Rust sync service, SQLite storage, and Ubuntu deployment files.
 - `docs/reference/` H59 notes. The [original Python client and dashboard](https://github.com/Adventnl/OpenHK50/tree/95a879f70a023fe3e097e9a33010b9e4eddccec5) remain in Git history.

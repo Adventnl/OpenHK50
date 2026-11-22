@@ -1,5 +1,7 @@
 #[cfg(feature = "android")]
 mod android;
+#[cfg(feature = "backup")]
+pub mod backup;
 
 pub const FRAME_LEN: usize = 16;
 pub const HEART_HISTORY: u8 = 21;
@@ -9,6 +11,15 @@ pub const STEPS: u8 = 67;
 pub struct Interval {
     pub minute: u16,
     pub value: u16,
+}
+
+#[cfg(feature = "activity")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityInterval {
+    pub minute: u16,
+    pub steps: Option<u16>,
+    pub calories: Option<u16>,
+    pub distance: Option<u16>,
 }
 
 pub fn encode(command: u8, payload: &[u8]) -> Option<[u8; FRAME_LEN]> {
@@ -73,20 +84,8 @@ fn bcd(value: u8) -> Option<u32> {
 
 pub fn step_intervals(frames: &[u8], date: u32) -> Vec<Interval> {
     let mut slots = [None; 96];
-    for frame in frames.chunks_exact(FRAME_LEN) {
-        if !valid(frame) || frame[0] != STEPS {
-            continue;
-        }
-        let (Some(year), Some(month), Some(day)) = (bcd(frame[1]), bcd(frame[2]), bcd(frame[3]))
-        else {
-            continue;
-        };
-        if 20_000_000 + year * 10_000 + month * 100 + day != date {
-            continue;
-        }
-        let slot = usize::from(frame[4]);
-        let value = u16::from_le_bytes([frame[9], frame[10]]);
-        if slot < slots.len() && value != u16::MAX {
+    for (slot, frame) in step_packets(frames, date) {
+        if let Some(value) = activity_field(frame, 9) {
             slots[slot] = Some(value);
         }
     }
@@ -94,12 +93,49 @@ pub fn step_intervals(frames: &[u8], date: u32) -> Vec<Interval> {
         .into_iter()
         .enumerate()
         .filter_map(|(slot, value)| {
-            value.map(|value| Interval {
+            Some(Interval {
                 minute: (slot * 15) as u16,
-                value,
+                value: value?,
             })
         })
         .collect()
+}
+
+#[cfg(feature = "activity")]
+pub fn activity_intervals(frames: &[u8], date: u32) -> Vec<ActivityInterval> {
+    let mut slots = [None; 96];
+    for (slot, frame) in step_packets(frames, date) {
+        let mut values = slots[slot].unwrap_or(ActivityInterval {
+            minute: (slot * 15) as u16,
+            steps: None,
+            calories: None,
+            distance: None,
+        });
+        values.steps = activity_field(frame, 9).or(values.steps);
+        values.calories = activity_field(frame, 7).or(values.calories);
+        values.distance = activity_field(frame, 11).or(values.distance);
+        slots[slot] = Some(values);
+    }
+    slots.into_iter().flatten().collect()
+}
+
+fn step_packets(frames: &[u8], date: u32) -> impl Iterator<Item = (usize, &[u8])> {
+    frames.chunks_exact(FRAME_LEN).filter_map(move |frame| {
+        if !valid(frame) || frame[0] != STEPS {
+            return None;
+        }
+        let year = bcd(frame[1])?;
+        let month = bcd(frame[2])?;
+        let day = bcd(frame[3])?;
+        let slot = usize::from(frame[4]);
+        (slot < 96 && 20_000_000 + year * 10_000 + month * 100 + day == date)
+            .then_some((slot, frame))
+    })
+}
+
+fn activity_field(frame: &[u8], index: usize) -> Option<u16> {
+    let value = u16::from_le_bytes([frame[index], frame[index + 1]]);
+    (value != u16::MAX).then_some(value)
 }
 
 #[cfg(test)]
@@ -137,5 +173,28 @@ mod tests {
             }]
         );
         assert!(step_intervals(&frame, 20261120).is_empty());
+    }
+
+    #[cfg(feature = "activity")]
+    #[test]
+    fn activity_keeps_known_fields_when_a_duplicate_has_missing_values() {
+        let payload = [0x26, 0x11, 0x21, 5, 0, 0, 23, 0, 40, 0, 99, 0];
+        let mut update = payload;
+        update[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+        update[8] = 41;
+        let frames = [
+            encode(STEPS, &payload).unwrap(),
+            encode(STEPS, &update).unwrap(),
+        ]
+        .concat();
+        assert_eq!(
+            activity_intervals(&frames, 20261121),
+            [ActivityInterval {
+                minute: 75,
+                steps: Some(41),
+                calories: Some(23),
+                distance: Some(99),
+            }]
+        );
     }
 }

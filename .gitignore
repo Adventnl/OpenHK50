@@ -6,6 +6,8 @@ android/local.properties
 *.keystore
 
 # Rust
+desktop/target/
+protocol/target/
 server/target/
 
 # Local configuration, captures, and health data
@@ -19,4 +21,3 @@ prompt.txt
 *.sqlite3-wal
 *.sqlite3-shm
 .DS_Store
-protocol/target/

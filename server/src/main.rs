@@ -1,5 +1,6 @@
-mod api;
 mod store;
+
+use openh_k50_protocol::backup as api;
 
 use axum::{
     Json, Router,

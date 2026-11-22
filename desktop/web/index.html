@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>OpenHK50</title>
+  <link rel="stylesheet" href="/web/style.css">
+  <script type="module" src="/web/app.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="header-inner">
+      <a class="wordmark" href="/">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" aria-hidden="true">
+          <path d="M2 12h5l3-7 4 14 3-7h5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/>
+        </svg>
+        OpenHK50
+      </a>
+      <span id="connection-indicator" class="connection">Disconnected</span>
+    </div>
+  </header>
+  <main class="shell">
+    <div class="daybar">
+      <div>
+        <h1 id="day-title">Today</h1>
+        <p id="day-label" class="day-label"></p>
+      </div>
+      <div class="date-controls" aria-label="History date">
+        <button id="previous-day" type="button" class="icon-button" aria-label="Previous day">
+          <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true"><path d="m12 5-5 5 5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <input id="date" aria-label="History date" type="date">
+        <button id="next-day" type="button" class="icon-button" aria-label="Next day" disabled>
+          <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true"><path d="m8 5 5 5-5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="today" type="button" class="quiet" hidden>Today</button>
+      </div>
+    </div>
+    <p id="app-error" class="feedback error" role="alert" hidden></p>
+    <div class="dashboard">
+      <div class="main-column">
+        <section class="panel" aria-labelledby="health-title">
+          <div class="panel-heading">
+            <h2 id="health-title">Health &amp; activity</h2>
+            <button id="measure" type="button" hidden>Measure</button>
+          </div>
+          <div class="metrics" id="metrics" aria-label="Choose a metric"></div>
+          <p class="feedback" id="live" role="status" hidden></p>
+          <div class="plot">
+            <canvas id="plot" aria-hidden="true"></canvas>
+            <p id="no-readings" class="plot-empty">No readings for this day.</p>
+          </div>
+          <div class="plot-time" aria-hidden="true"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          <details id="readings" class="readings" hidden>
+            <summary id="readings-title">Readings</summary>
+            <div class="reading-scroll">
+              <table>
+                <thead><tr><th scope="col">Time</th><th scope="col">Value</th><th scope="col">Source</th></tr></thead>
+                <tbody id="reading-rows"></tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+
+        <section id="workouts" class="panel" aria-labelledby="workout-title">
+          <div class="panel-heading"><h2 id="workout-title">Workout</h2></div>
+          <form id="workout-start" class="workout-form">
+            <label>Activity <select id="activity" required></select></label>
+            <label>Weight (kg) <input id="weight" type="number" min="20" max="400" step="0.1" inputmode="decimal" required></label>
+            <button type="submit" class="primary">Start workout</button>
+          </form>
+          <div id="workout-active" class="workout-active" hidden>
+            <div><strong id="active-activity"></strong><p id="workout-estimate" class="secondary"></p></div>
+            <time id="workout-clock" class="timer">0:00</time>
+            <button id="workout-stop" type="button">End workout</button>
+          </div>
+          <p id="no-workouts" class="secondary empty-workouts">No workouts for this day.</p>
+          <ul id="workout-history" class="workout-history"></ul>
+        </section>
+
+        <section id="sleep" class="panel" aria-labelledby="sleep-title">
+          <div class="panel-heading"><h2 id="sleep-title">Sleep</h2><span id="sleep-duration" class="sleep-duration"></span></div>
+          <p id="sleep-summary" class="secondary"></p>
+          <canvas id="sleep-timeline" class="sleep-timeline" aria-hidden="true" hidden></canvas>
+          <ul id="sleep-stages" class="sleep-stages"></ul>
+        </section>
+      </div>
+
+      <aside class="side-column" aria-label="Band and settings">
+        <section class="panel band" aria-labelledby="band-title">
+          <div class="panel-heading"><h2 id="band-title">Band</h2></div>
+          <div class="device">
+            <svg class="band-icon" viewBox="0 0 36 44" width="28" height="34" fill="none" aria-hidden="true">
+              <path d="M12 12V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v7m0 20v7a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-7" stroke="currentColor" stroke-width="1.7"/>
+              <rect x="9" y="11" width="18" height="22" rx="5" stroke="currentColor" stroke-width="1.7"/>
+              <path d="M15 24h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            </svg>
+            <div><strong id="device-name">No band selected</strong><p id="band-detail" class="secondary">Scan for a nearby HK50 or H59.</p></div>
+          </div>
+          <div id="band-disconnected" class="button-row">
+            <button id="scan" type="button" class="primary">Scan for bands</button>
+            <button id="reconnect" type="button" hidden>Reconnect</button>
+          </div>
+          <div id="band-connected" class="button-row" hidden>
+            <button id="sync" type="button" class="primary">Sync today</button>
+            <button id="disconnect" type="button">Disconnect</button>
+          </div>
+          <ul id="devices" class="device-list"></ul>
+          <p id="band-feedback" class="feedback" role="status" hidden></p>
+          <details id="band-controls" hidden>
+            <summary>Band controls</summary>
+            <div class="detail-controls">
+              <button id="sync-week" type="button">Import past 7 days</button>
+              <button id="clock" type="button">Set band clock</button>
+              <div class="control-group">
+                <span>Band heart-rate logging</span>
+                <div class="button-row">
+                  <button id="logging-on" type="button">Enable</button>
+                  <button id="logging-off" type="button">Pause</button>
+                </div>
+              </div>
+              <div id="ble-details" class="control-group" hidden>
+                <form id="details-form" class="stacked-form">
+                  <label>QWatch username <input id="username" maxlength="96" autocomplete="off" required></label>
+                  <button type="submit">Enable sleep &amp; oxygen sync</button>
+                </form>
+                <button id="details-off" type="button" hidden>Disable sleep &amp; oxygen sync</button>
+              </div>
+              <button id="copy-id" type="button" hidden>Copy Bluetooth ID</button>
+              <p id="copy-feedback" class="secondary" role="status" hidden></p>
+            </div>
+          </details>
+        </section>
+
+        <section id="notifications" class="panel" aria-labelledby="notification-title">
+          <div class="panel-heading"><h2 id="notification-title">Notifications</h2></div>
+          <div class="button-row">
+            <button id="notification-test" type="button">Simulate Android notification</button>
+            <button id="band-alert" type="button" hidden>Send band alert</button>
+          </div>
+          <p id="notification-feedback" class="feedback" role="status" hidden></p>
+        </section>
+
+        <section class="panel settings" aria-labelledby="settings-title">
+          <div class="panel-heading"><h2 id="settings-title">Settings</h2></div>
+          <div class="setting-list">
+            <label><span>Auto-sync</span><input id="auto-sync" type="checkbox" role="switch"></label>
+            <label><span>Workouts</span><input id="show-workouts" type="checkbox" role="switch"></label>
+            <label><span>Notification test</span><input id="show-notifications" type="checkbox" role="switch"></label>
+            <label><span>Extra health metrics</span><input id="show-extras" type="checkbox" role="switch"></label>
+          </div>
+          <details>
+            <summary>Server backup</summary>
+            <p id="backup-feedback" class="secondary" role="status"></p>
+            <button id="backup" type="button" hidden>Back up heart rate &amp; steps</button>
+          </details>
+        </section>
+      </aside>
+    </div>
+  </main>
+</body>
+</html>

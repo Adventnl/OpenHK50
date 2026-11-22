@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const PAGE: usize = 200;
 pub const MAX_TIME: i64 = 4_102_444_800_000;
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Kind {
     Heart,
@@ -19,7 +19,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Origin {
     History,
@@ -35,7 +35,7 @@ impl Origin {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reading {
     pub band: String,
@@ -90,7 +90,7 @@ pub fn is_hex(value: &str, length: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub store: Option<String>,
@@ -107,12 +107,12 @@ impl Request {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct StoreChanged {
     pub store: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Response {
     pub store: String,
     pub cursor: i64,
