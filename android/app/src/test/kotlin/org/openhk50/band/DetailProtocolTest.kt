@@ -59,7 +59,19 @@ class DetailProtocolTest {
         body[13] = 94
         body[14] = 98
         body[48] = 101
-        assertArrayEquals(intArrayOf((360 shl 16) or 98), DetailProtocol.oxygen(body, 2))
-        assertNull(DetailProtocol.oxygen(body, 1))
+        assertArrayEquals(intArrayOf((360 shl 16) or 98), DetailProtocol.oxygen(body, 3)[2])
+        assertTrue(DetailProtocol.oxygen(body, 2).isEmpty())
+    }
+
+    @Test
+    fun oxygenAcceptsBundledHk50RecordsAndRejectsPartialRecords() {
+        val yesterday = ByteArray(49).also { it[0] = 1; it[2] = 97 }
+        val today = ByteArray(49).also { it[4] = 99 }
+        val records = DetailProtocol.oxygen(yesterday + today, 7)
+        assertEquals(setOf(0, 1), records.keys)
+        assertArrayEquals(intArrayOf(97), records[1])
+        assertArrayEquals(intArrayOf((60 shl 16) or 99), records[0])
+        assertTrue(DetailProtocol.oxygen(yesterday + today.copyOf(48), 7).isEmpty())
+        assertEquals(setOf(0), DetailProtocol.oxygen(yesterday + today, 1).keys)
     }
 }

@@ -1,11 +1,12 @@
 package org.openhk50.ui
 
 import android.annotation.SuppressLint
-import android.app.Activity
+import android.Manifest
 import android.app.AlertDialog
 import android.app.DatePickerDialog
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -27,10 +28,14 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.view.PreviewView
 import org.openhk50.OpenHkApp
 import org.openhk50.band.BandAction
 import org.openhk50.band.BandClient
 import org.openhk50.band.BandState
+import org.openhk50.band.CallRelayService
 import org.openhk50.band.Connection
 import org.openhk50.data.HealthStore
 import org.openhk50.data.Metric
@@ -38,6 +43,9 @@ import org.openhk50.data.Origin
 import org.openhk50.data.Reading
 import org.openhk50.data.SleepNight
 import org.openhk50.data.SleepStage
+import org.openhk50.data.Workout
+import org.openhk50.data.WorkoutLog
+import org.openhk50.data.WorkoutType
 import org.openhk50.sync.BackupJob
 import java.text.NumberFormat
 import java.time.Instant
@@ -47,10 +55,11 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 
-class MainActivity : Activity() {
-    private enum class Tab(val title: String, val icon: Glyph) {
-        TODAY("Today", Glyph.PULSE), HISTORY("History", Glyph.CALENDAR),
-        BAND("Band", Glyph.BAND), BACKUP("Backup", Glyph.BACKUP)
+class MainActivity : ComponentActivity() {
+    private enum class Tab(val title: String, val icon: Glyph, val inNavigation: Boolean = true) {
+        TODAY("Today", Glyph.TODAY), HEALTH("Health", Glyph.PULSE), ACTIVITY("Activity", Glyph.WALK),
+        HISTORY("History", Glyph.CALENDAR), BAND("Band", Glyph.BAND),
+        BACKUP("Backup", Glyph.BACKUP, false), CAMERA("Wrist shutter", Glyph.CAMERA, false)
     }
     private enum class PermissionAction { SCAN, RECONNECT }
 
@@ -64,8 +73,33 @@ class MainActivity : Activity() {
     private var tab = Tab.TODAY
     private var historyMetric: Metric? = Metric.HEART
     private var historyDate = LocalDate.now()
+    private var historyWeek = false
     private var shownRecords = 24
     private var currentDay: HealthStore.Day? = null
+    private var week: List<Pair<LocalDate, HealthStore.Day>> = emptyList()
+    private var workouts: WorkoutLog? = null
+    private var workoutBusy = false
+    private var workoutLimit = 30
+    private var workoutTimer: TextView? = null
+    private var camera: BandCamera? = null
+    private var resumed = false
+    private val tickWorkout = object : Runnable {
+        override fun run() {
+            val workout = workouts?.active ?: return
+            updateWorkoutTimer(workout)
+            app.main.postDelayed(this, 1_000)
+        }
+    }
+    private val checkDay = object : Runnable {
+        override fun run() {
+            if (tab in DAILY_TABS && lastShownDate != LocalDate.now(band.zone)) {
+                currentDay = null
+                drawScreen(keepScroll = true)
+                loadData()
+            }
+            app.main.postDelayed(this, 30_000)
+        }
+    }
     private var pendingCount = 0L
     private var queryGeneration = 0
     private var readIssue: String? = null
@@ -78,13 +112,41 @@ class MainActivity : Activity() {
     private var lastDevice: String? = null
     private var lastShownDate: LocalDate? = null
 
+    private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val action = permissionAction
+        permissionAction = null
+        if (action != null) {
+            if (BandClient.hasPermissions(this)) startBluetoothAction(action)
+            else permissionSettings("Bluetooth access", "Allow Bluetooth access to find and connect to your band.")
+        }
+    }
+    private val enableBluetooth = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val action = permissionAction
+        permissionAction = null
+        if (result.resultCode == RESULT_OK && action != null && BandClient.hasPermissions(this)) {
+            startBluetoothAction(action)
+        }
+    }
+    private val callPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) startCallAlerts()
+        else permissionSettings("Phone access", "Allow phone access to relay incoming calls to the band.")
+    }
+    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) go(Tab.CAMERA)
+        else permissionSettings("Camera access", "Allow camera access to use the wrist shutter.")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val night = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
         palette = Palette.of(night)
         expanded = resources.configuration.screenWidthDp >= 680
         tab = savedInstanceState?.getString("tab")?.let(Tab::valueOf) ?: Tab.TODAY
+        if (tab == Tab.CAMERA && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            tab = Tab.BAND
+        }
         historyDate = savedInstanceState?.getString("day")?.let(LocalDate::parse) ?: LocalDate.now(band.zone)
+        historyWeek = savedInstanceState?.getBoolean("historyWeek") == true
         historyMetric = when (val metric = savedInstanceState?.getString("metric")) {
             null -> Metric.HEART
             "SLEEP" -> null
@@ -99,7 +161,9 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         active = true
-        app.changed = { loadData() }
+        app.changed = {
+            if (tab == Tab.BAND) drawScreen(keepScroll = true) else loadData()
+        }
         band.changed = {
             val device = band.state.device?.address
             if (lastDevice != device) {
@@ -107,15 +171,29 @@ class MainActivity : Activity() {
                 currentDay = null
                 loadData()
             }
-            if (tab == Tab.TODAY && lastShownDate != LocalDate.now(band.zone)) {
+            if (tab in DAILY_TABS && lastShownDate != LocalDate.now(band.zone)) {
                 currentDay = null
                 loadData()
             }
-            if (tab != Tab.BACKUP) drawScreen(keepScroll = true)
+            if (tab == Tab.CAMERA) camera?.update()
+            else if (tab != Tab.BACKUP) drawScreen(keepScroll = true)
         }
         band.foreground(true)
         if (app.settings.state().endpoint != null) BackupJob.schedule(this)
         loadData()
+        app.main.postDelayed(checkDay, 30_000)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        camera?.resume(true)
+    }
+
+    override fun onPause() {
+        resumed = false
+        camera?.resume(false)
+        super.onPause()
     }
 
     override fun onStop() {
@@ -123,10 +201,13 @@ class MainActivity : Activity() {
         active = false
         app.changed = null
         band.changed = null
+        app.main.removeCallbacks(tickWorkout)
+        app.main.removeCallbacks(checkDay)
         if (!isChangingConfigurations && permissionAction == null) band.foreground(false)
     }
 
     override fun onDestroy() {
+        camera?.close()
         if (Build.VERSION.SDK_INT >= 33) backCallback?.let(onBackInvokedDispatcher::unregisterOnBackInvokedCallback)
         super.onDestroy()
     }
@@ -134,6 +215,7 @@ class MainActivity : Activity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("tab", tab.name)
         outState.putString("day", historyDate.toString())
+        outState.putBoolean("historyWeek", historyWeek)
         outState.putString("metric", historyMetric?.name ?: "SLEEP")
         outState.putString("permission", permissionAction?.name)
         super.onSaveInstanceState(outState)
@@ -197,8 +279,8 @@ class MainActivity : Activity() {
         navigation.removeAllViews()
         navigation.setPadding(dp(8), dp(6), dp(8), dp(6))
         navigation.setBackgroundColor(if (expanded) palette.background else palette.surface)
-        for (item in Tab.entries) {
-            val selected = item == tab
+        for (item in Tab.entries.filter { it.inNavigation }) {
+            val selected = item == tab || (item == Tab.BAND && backDestination() == Tab.BAND)
             val color = if (selected) palette.brand else palette.muted
             val cell = column().apply {
                 gravity = Gravity.CENTER
@@ -213,7 +295,7 @@ class MainActivity : Activity() {
                 if (selected) background = shape(palette.tint, 18)
             }
             pill.addView(Icon(this, item.icon, color), FrameLayout.LayoutParams(dp(21), dp(21), Gravity.CENTER))
-            cell.addView(pill, lp(dp(54), dp(30)))
+            cell.addView(pill, lp(dp(48), dp(28)))
             cell.addView(label(item.title, 12, color, if (selected) "sans-serif-medium" else "sans-serif")
                 .apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }, lp(-2, -2))
             navigation.addView(cell, if (expanded) lp(-1, -2) else lp(0, -2, 1f))
@@ -222,22 +304,27 @@ class MainActivity : Activity() {
 
     private fun go(next: Tab) {
         if (tab == next) return
+        camera?.close()
+        camera = null
         tab = next
         queryGeneration++
         backupMessage = null
-        if (next == Tab.HISTORY || next == Tab.TODAY) currentDay = null
+        if (next == Tab.HISTORY || next in DAILY_TABS) currentDay = null
+        if (next == Tab.HISTORY) week = emptyList()
         drawNavigation()
         updateBack()
         drawScreen()
         loadData()
     }
 
+    private fun backDestination() = if (tab == Tab.BACKUP || tab == Tab.CAMERA) Tab.BAND else Tab.TODAY
+
     private fun updateBack() {
         if (Build.VERSION.SDK_INT >= 33) {
             backCallback?.let(onBackInvokedDispatcher::unregisterOnBackInvokedCallback)
             backCallback = null
             if (tab != Tab.TODAY) {
-                val callback = OnBackInvokedCallback { go(Tab.TODAY) }
+                val callback = OnBackInvokedCallback { go(backDestination()) }
                 backCallback = callback
                 onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
             }
@@ -248,24 +335,37 @@ class MainActivity : Activity() {
     @SuppressLint("GestureBackNavigation") // updateBack handles API 33+ with the platform dispatcher.
     @Deprecated("Required on Android 12 and earlier")
     override fun onBackPressed() {
-        if (Build.VERSION.SDK_INT < 33 && tab != Tab.TODAY) go(Tab.TODAY) else super.onBackPressed()
+        if (Build.VERSION.SDK_INT < 33 && tab != Tab.TODAY) go(backDestination()) else super.onBackPressed()
     }
 
     private fun loadData() {
-        if (!active || tab == Tab.BAND) return
+        if (!active || tab == Tab.BAND || tab == Tab.CAMERA) return
         val generation = ++queryGeneration
         val address = band.state.device?.address
         val zone = band.zone
-        val isBackup = tab == Tab.BACKUP
-        val date = if (tab == Tab.HISTORY) historyDate else LocalDate.now(zone)
+        val destination = tab
+        val trends = destination == Tab.HISTORY && historyWeek
+        val limit = workoutLimit
+        val date = if (destination == Tab.HISTORY) historyDate else LocalDate.now(zone)
         app.databaseThread.execute {
             val result = runCatching {
-                if (isBackup) null to app.health.pendingCount() else app.health.day(address, date, zone) to 0L
+                DataSnapshot(
+                    day = if (destination == Tab.BACKUP || trends) null else app.health.day(address, date, zone),
+                    week = if (trends) app.health.week(address, date, zone) else emptyList(),
+                    workouts = when (destination) {
+                        Tab.TODAY -> app.health.workouts(30)
+                        Tab.ACTIVITY -> app.health.workouts(limit)
+                        else -> null
+                    },
+                    pending = if (destination == Tab.BACKUP) app.health.pendingCount() else 0L
+                )
             }
             app.main.post {
                 if (active && generation == queryGeneration) {
-                    result.onSuccess { (day, count) ->
+                    result.onSuccess { (day, trend, log, count) ->
                         currentDay = day
+                        week = trend
+                        if (log != null) workouts = log
                         pendingCount = count
                         readIssue = null
                     }.onFailure { readIssue = "Couldn’t open your records. Reopen the app to try again." }
@@ -275,7 +375,18 @@ class MainActivity : Activity() {
         }
     }
 
+    private data class DataSnapshot(
+        val day: HealthStore.Day?, val week: List<Pair<LocalDate, HealthStore.Day>>,
+        val workouts: WorkoutLog?, val pending: Long
+    )
+
     private fun drawScreen(keepScroll: Boolean = false) {
+        app.main.removeCallbacks(tickWorkout)
+        workoutTimer = null
+        if (tab == Tab.CAMERA) {
+            if (camera == null) cameraScreen()
+            return
+        }
         val previous = if (keepScroll) scroll?.scrollY ?: 0 else 0
         val page = column().apply { setPadding(dp(22), dp(18), dp(22), dp(26)) }
         val viewport = ScrollView(this).apply {
@@ -293,65 +404,194 @@ class MainActivity : Activity() {
 
         when (tab) {
             Tab.TODAY -> today(page)
+            Tab.HEALTH -> health(page)
+            Tab.ACTIVITY -> activity(page)
             Tab.HISTORY -> history(page)
             Tab.BAND -> bandPage(page)
             Tab.BACKUP -> backupPage(page)
+            Tab.CAMERA -> Unit
         }
         if (previous > 0) viewport.post { viewport.scrollTo(0, previous) }
     }
 
     private fun today(page: LinearLayout) {
-        val state = band.state
-        val zone = band.zone
-        val today = LocalDate.now(zone)
+        val today = LocalDate.now(band.zone)
         lastShownDate = today
         title(page, "Today", today.format(LONG_DATE))
-        block(page, connectionStrip(state), 21)
-        app.storageIssue?.let { note(page, it, 12, true) }
-        readIssue?.let { note(page, it, 12, true) }
+        block(page, connectionStrip(band.state), 16)
+        showReadIssues(page)
 
         val day = currentDay
-        heading(page, "Activity", 26)
-        val activity = panel()
-        activity.addView(summaryRow(Metric.STEPS, day?.value(Metric.STEPS)) { openHistory(Metric.STEPS, today) }, lp(-1, -2))
-        val steps = day?.readings(Metric.STEPS).orEmpty()
-        if (steps.isNotEmpty()) block(activity, SeriesChart(this, palette, Metric.STEPS, today, zone, steps), 4, dp(112))
-        block(page, activity, 9)
+        val summaries = row().apply { gravity = Gravity.TOP }
+        summaries.addView(dailyTile("Steps", Metric.STEPS, day?.value(Metric.STEPS), today), lp(0, -1, 1f))
+        summaries.addView(dailyTile("Average heart rate", Metric.HEART, day?.averageHeartRate(), today),
+            lp(0, -1, 1f).apply { marginStart = dp(10) })
+        block(page, summaries, 20)
 
-        heading(page, "Health", 26)
-        val health = panel()
-        for (metric in Metric.entries.filter { it != Metric.STEPS }) {
-            if (health.childCount > 0) divider(health)
-            val value = state.liveValue?.toLong()?.takeIf { state.measurement == metric } ?: day?.value(metric)
-            health.addView(summaryRow(metric, value) { openHistory(metric, today) }, lp(-1, -2))
-        }
-        divider(health)
-        health.addView(summaryRow("Sleep", Glyph.MOON, palette.brand, day?.sleep?.let { duration(it.asleepMinutes) }) {
+        heading(page, "Steps by time", 22)
+        val steps = day?.readings(Metric.STEPS).orEmpty()
+        val chart = panel()
+        if (steps.isEmpty()) note(chart, if (day == null && readIssue == null) "Loading steps…" else "No steps recorded today", 4)
+        else block(chart, SeriesChart(this, palette, Metric.STEPS, today, band.zone, steps), 3, dp(132))
+        block(page, chart, 10)
+
+        heading(page, "Your day", 23)
+        val daily = panel()
+        daily.addView(summaryRow("Sleep", Glyph.MOON, palette.brand, day?.sleep?.let { duration(it.asleepMinutes) }) {
             openHistory(null, today)
         }, lp(-1, -2))
-        block(page, health, 9)
+        divider(daily)
+        daily.addView(summaryRow("Health monitor", Glyph.PULSE, palette.heart, null, showMissing = false) {
+            go(Tab.HEALTH)
+        }, lp(-1, -2))
+        divider(daily)
+        val activeWorkout = workouts?.active
+        val workoutValue = activeWorkout?.type?.title ?: workouts?.recent?.count {
+            Instant.ofEpochMilli(it.start).atZone(band.zone).toLocalDate() == today
+        }?.takeIf { it > 0 }?.toString()
+        daily.addView(summaryRow("Workouts", Glyph.WALK, palette.steps, workoutValue, showMissing = false) {
+            go(Tab.ACTIVITY)
+        }, lp(-1, -2))
+        block(page, daily, 9)
+    }
+
+    private fun dailyTile(title: String, metric: Metric, value: Long?, date: LocalDate) = panel().apply {
+        setPadding(dp(14), dp(13), dp(14), dp(15))
+        background = pressable(palette.surface, palette.accent(metric), 16)
+        isFocusable = true
+        contentDescription = "$title, ${value?.let { displayValue(metric, it) } ?: "no reading"}"
+        setOnClickListener { openHistory(metric, date) }
+        addView(Icon(this@MainActivity, metric.icon, palette.accent(metric)), lp(dp(23), dp(23)))
+        val reading = value?.let { if (metric == Metric.STEPS) number(it) else displayValue(metric, it) }
+        block(this, label(reading ?: "—", 27, palette.accent(metric), "sans-serif-medium"), 7)
+        block(this, label(title, 14, palette.ink, "sans-serif-medium"), 2)
+    }
+
+    private fun showReadIssues(page: LinearLayout) {
+        app.storageIssue?.let { note(page, it, 12, true) }
+        readIssue?.let { note(page, it, 12, true) }
+    }
+
+    private fun health(page: LinearLayout) {
+        val today = LocalDate.now(band.zone)
+        lastShownDate = today
+        title(page, "Health monitor")
+        showReadIssues(page)
+        val day = currentDay
+        val metrics = panel()
+        for (metric in HEALTH_METRICS) {
+            if (metrics.childCount > 0) divider(metrics)
+            val live = band.state.liveValue?.toLong()?.takeIf { band.state.measurement == metric }
+            metrics.addView(summaryRow(metric, live ?: day?.value(metric)) { openHistory(metric, today) }, lp(-1, -2))
+        }
+        block(page, metrics, 18)
+        heading(page, "Sleep", 22)
+        block(page, sleepPanel(day?.sleep), 9)
+        addButton(page, "Sleep history", filled = false, top = 10) { openHistory(null, today) }
+    }
+
+    private fun activity(page: LinearLayout) {
+        val today = LocalDate.now(band.zone)
+        lastShownDate = today
+        title(page, "Activity")
+        showReadIssues(page)
+        val day = currentDay
+        val daily = panel()
+        for (metric in ACTIVITY_METRICS) {
+            if (daily.childCount > 0) divider(daily)
+            daily.addView(summaryRow(metric, day?.value(metric)) { openHistory(metric, today) }, lp(-1, -2))
+        }
+        block(page, daily, 16)
+
+        heading(page, "Workout recorder", 24)
+        val log = workouts
+        val recorder = panel()
+        val workout = log?.active
+        if (workout == null) {
+            addButton(recorder, "Start workout", enabled = !workoutBusy && log != null, top = 0) {
+                AlertDialog.Builder(this).setTitle("Workout type")
+                    .setItems(WorkoutType.entries.map { it.title }.toTypedArray()) { _, index ->
+                        val address = band.state.device?.address
+                        val start = System.currentTimeMillis()
+                        changeWorkout { app.health.startWorkout(WorkoutType.entries[index], start, address) }
+                    }.setNegativeButton("Cancel", null).show()
+            }
+        } else {
+            recorder.addView(label(workout.type.title, 17, palette.ink, "sans-serif-medium"))
+            workoutTimer = label("", 36, palette.brand, "sans-serif-medium")
+            block(recorder, requireNotNull(workoutTimer), 5)
+            updateWorkoutTimer(workout)
+            if (active) app.main.postDelayed(tickWorkout, 1_000)
+            addButton(recorder, "End workout", enabled = !workoutBusy, top = 9) {
+                changeWorkout { app.health.endWorkout(workout.start, System.currentTimeMillis()) }
+            }
+        }
+        block(page, recorder, 9)
+
+        heading(page, "Workout history", 24)
+        val records = panel()
+        for (record in log?.recent.orEmpty()) {
+            if (records.childCount > 0) divider(records)
+            val line = row().apply { setPadding(0, dp(9), 0, dp(9)); minimumHeight = dp(52) }
+            val identity = column()
+            identity.addView(label(record.type.title, 16, palette.ink, "sans-serif-medium"))
+            note(identity, dateTime(record.start, band.zone), 3)
+            record.averageHeartRate?.let { note(identity, "Average heart rate · ${displayValue(Metric.HEART, it.toLong())}", 3) }
+            line.addView(identity, lp(0, -2, 1f))
+            line.addView(label(workoutDuration(record), 15, palette.ink), lp(-2, -2).apply { marginStart = dp(8) })
+            records.addView(line, lp(-1, -2))
+        }
+        if (records.childCount == 0) note(records, if (log == null && readIssue == null) "Loading workouts…" else "No workouts recorded", 2)
+        block(page, records, 9)
+        if (log?.hasMore == true) addButton(page, "Show more workouts", filled = false, top = 9) {
+            workoutLimit += 30
+            loadData()
+        }
+    }
+
+    private fun changeWorkout(change: () -> Unit) {
+        if (workoutBusy) return
+        workoutBusy = true
+        drawScreen(keepScroll = true)
+        app.write("Couldn’t save the workout. Check phone storage and try again.") {
+            try {
+                change()
+            } finally {
+                app.main.post { workoutBusy = false }
+            }
+        }
+    }
+
+    private fun updateWorkoutTimer(workout: Workout) {
+        workoutTimer?.text = workoutDuration(workout)
+    }
+
+    private fun workoutDuration(workout: Workout): String {
+        val elapsed = workout.seconds(System.currentTimeMillis())
+        return String.format(java.util.Locale.getDefault(), "%02d:%02d:%02d", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
     }
 
     private fun openHistory(metric: Metric?, day: LocalDate) {
         historyMetric = metric
+        historyWeek = false
         historyDate = day
         shownRecords = 24
         go(Tab.HISTORY)
     }
 
     private fun summaryRow(metric: Metric, value: Long?, action: () -> Unit) =
-        summaryRow(metric.title, metric.icon, palette.accent(metric), value?.let { displayValue(metric, it) }, action)
+        summaryRow(metric.title, metric.icon, palette.accent(metric), value?.let { displayValue(metric, it) }, action = action)
 
-    private fun summaryRow(title: String, icon: Glyph, accent: Int, value: String?, action: () -> Unit) = row().apply {
+    private fun summaryRow(title: String, icon: Glyph, accent: Int, value: String?, showMissing: Boolean = true, action: () -> Unit) = row().apply {
         minimumHeight = dp(55)
         setPadding(0, dp(7), 0, dp(7))
         background = pressable(Color.TRANSPARENT, palette.ink, 11)
         isFocusable = true
-        contentDescription = "$title, ${value ?: "no reading"}"
+        contentDescription = if (value != null || showMissing) "$title, ${value ?: "no reading"}" else title
         setOnClickListener { action() }
         addView(Icon(this@MainActivity, icon, accent), lp(dp(23), dp(23)))
         addView(label(title, 16, palette.ink, "sans-serif-medium"), lp(0, -2, 1f).apply { marginStart = dp(12) })
-        addView(label(value ?: "—", 15, palette.muted),
+        if (value != null || showMissing) addView(label(value ?: "—", 15, palette.muted),
             lp(-2, -2).apply { marginStart = dp(8) })
         addView(Icon(this@MainActivity, Glyph.RIGHT, palette.muted), lp(dp(15), dp(15)).apply { marginStart = dp(8) })
     }
@@ -361,26 +601,47 @@ class MainActivity : Activity() {
         val zone = band.zone
         val day = currentDay
         val today = LocalDate.now(zone)
+        val hasEarlier = if (historyWeek) week.firstOrNull()?.second?.earlier == true else day?.earlier == true
+        val dateStep = if (historyWeek) 7L else 1L
         val dateRow = row().apply { background = shape(palette.surface, 15, palette.border); setPadding(dp(5), 0, dp(5), 0) }
-        dateRow.addView(iconButton(Glyph.LEFT, "Previous day", day?.earlier == true) { selectDate(historyDate.minusDays(1)) }, lp(dp(48), dp(52)))
-        val date = label(historyDate.format(SHORT_DATE), 15, palette.ink, "sans-serif-medium").apply {
+        dateRow.addView(iconButton(Glyph.LEFT, "Previous period", hasEarlier) {
+            selectDate(historyDate.minusDays(dateStep))
+        }, lp(dp(48), dp(52)))
+        val dateText = if (historyWeek) {
+            "${historyDate.minusDays(6).format(MONTH_DAY)} – ${historyDate.format(MONTH_DAY)}"
+        } else historyDate.format(SHORT_DATE)
+        val date = label(dateText, 15, palette.ink, "sans-serif-medium").apply {
             gravity = Gravity.CENTER
             minHeight = dp(48)
-            contentDescription = "Choose date, ${historyDate.format(LONG_DATE)}"
+            contentDescription = "Choose date, $dateText"
             background = pressable(Color.TRANSPARENT, palette.ink, 12)
             isFocusable = true
             setOnClickListener {
                 DatePickerDialog(this@MainActivity, { _, y, m, d -> selectDate(LocalDate.of(y, m + 1, d)) },
                     historyDate.year, historyDate.monthValue - 1, historyDate.dayOfMonth
                 ).apply {
-                    datePicker.maxDate = System.currentTimeMillis()
+                    datePicker.maxDate = today.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli() - 1
                     show()
                 }
             }
         }
         dateRow.addView(date, lp(0, -2, 1f))
-        dateRow.addView(iconButton(Glyph.RIGHT, "Next day", historyDate < today) { selectDate(historyDate.plusDays(1)) }, lp(dp(48), dp(52)))
+        dateRow.addView(iconButton(Glyph.RIGHT, "Next period", historyDate < today) {
+            selectDate(historyDate.plusDays(dateStep))
+        }, lp(dp(48), dp(52)))
         block(page, dateRow, 18)
+        val periods = row()
+        listOf(false to "Day", true to "7 days").forEach { (isWeek, name) ->
+            periods.addView(button(name, filled = historyWeek == isWeek) {
+                if (historyWeek != isWeek) {
+                    historyWeek = isWeek
+                    selectDate(historyDate)
+                }
+            }.apply { isSelected = historyWeek == isWeek }, lp(0, -2, 1f).apply {
+                if (isWeek) marginStart = dp(8)
+            })
+        }
+        block(page, periods, 8)
 
         val metric = historyMetric
         val metricName = metric?.title ?: "Sleep"
@@ -408,6 +669,10 @@ class MainActivity : Activity() {
         block(page, picker, 10)
         readIssue?.let { note(page, it, 12, true) }
 
+        if (historyWeek) {
+            weeklyHistory(page, metric)
+            return
+        }
         if (metric == null) {
             block(page, sleepPanel(day?.sleep), 16)
             return
@@ -415,8 +680,11 @@ class MainActivity : Activity() {
         val values = day?.readings(metric).orEmpty()
         val state = band.state
         val currentMeasurement = state.measurement == metric && historyDate == today
-        val value = state.liveValue?.takeIf { currentMeasurement }?.toLong() ?: day?.value(metric)
-        val detail = metricPanel(metric, values, historyDate, zone, value)
+        val live = state.liveValue?.takeIf { currentMeasurement }?.toLong()
+        val detail = metricPanel(metric, values, historyDate, zone, live ?: day?.value(metric), live != null)
+        if (metric == Metric.HEART) day?.averageHeartRate()?.let {
+            note(detail, "Average heart rate · ${displayValue(metric, it)}", 7)
+        }
         if (historyDate == today && metric.liveType != null) {
             val measuring = currentMeasurement && state.action == BandAction.MEASURING
             if (state.connection == Connection.CONNECTED) {
@@ -451,6 +719,35 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun weeklyHistory(page: LinearLayout, metric: Metric?) {
+        val values = week.map { (_, day) ->
+            when (metric) {
+                null -> day.sleep?.asleepMinutes?.toLong()
+                Metric.HEART -> day.averageHeartRate()
+                else -> day.value(metric)
+            }
+        }
+        val plot = panel()
+        if (values.none { it != null }) {
+            note(plot, if (week.isEmpty() && readIssue == null) "Loading readings…" else "No readings for this period", 4)
+        } else {
+            if (metric == Metric.HEART) section(plot, Glyph.PULSE, "Daily average heart rate", palette.heart)
+            block(plot, WeekChart(this, palette, metric?.let(palette::accent) ?: palette.brand,
+                week.map { it.first.format(WEEKDAY) }, values, metric == null || metric.isTotal), 5, dp(150))
+            for ((index, entry) in week.withIndex().reversed()) {
+                divider(plot)
+                val value = values[index]?.let {
+                    if (metric == null) duration(it.toInt()) else displayValue(metric, it)
+                }
+                plot.addView(summaryRow(entry.first.format(SHORT_DATE), Glyph.CALENDAR, palette.muted, value) {
+                    historyWeek = false
+                    selectDate(entry.first)
+                }, lp(-1, -2))
+            }
+        }
+        block(page, plot, 13)
+    }
+
     private fun sleepPanel(night: SleepNight?) = panel().apply {
         if (night == null) {
             note(this, if (currentDay == null && readIssue == null) "Loading readings…" else "No sleep recorded", 3)
@@ -483,6 +780,7 @@ class MainActivity : Activity() {
         historyDate = day.coerceAtMost(LocalDate.now(band.zone))
         shownRecords = 24
         currentDay = null
+        week = emptyList()
         drawScreen()
         loadData()
     }
@@ -499,9 +797,8 @@ class MainActivity : Activity() {
         line.addView(Icon(this, Glyph.BAND, palette.brand), lp(dp(32), dp(32)))
         val words = column()
         words.addView(label(device?.name ?: "Connect a band", 17, palette.ink, "sans-serif-medium"))
-        words.addView(label(
-            if (device == null) "HK50 and H59" else connectionText(state), 13, palette.muted
-        ), lp(-1, -2).apply { topMargin = dp(3) })
+        if (device != null) words.addView(label(connectionText(state), 13, palette.muted),
+            lp(-1, -2).apply { topMargin = dp(3) })
         line.addView(words, lp(0, -2, 1f).apply { marginStart = dp(12) })
         val battery = state.battery
         if (battery != null) line.addView(label("$battery%", 17, palette.brand, "sans-serif-medium")
@@ -564,6 +861,16 @@ class MainActivity : Activity() {
         }
         block(page, devicePanel, 20)
 
+        heading(page, "Band tools", 24)
+        val tools = panel()
+        actionRow(tools, "Find band", Glyph.SCAN, connected && idle) { band.findBand() }
+        actionRow(tools, "Wrist shutter", Glyph.CAMERA, true, action = ::openCamera)
+        actionRow(tools, if (app.callAlertsRunning) "Turn off call alerts" else "Turn on call alerts",
+            Glyph.PHONE, app.callAlertsRunning || state.device != null) { toggleCallAlerts() }
+        if (connected) actionRow(tools, "Test call alert", Glyph.PHONE, idle) { band.testCallAlert() }
+        app.callAlertsIssue?.let { note(tools, it, 7, true) }
+        block(page, tools, 9)
+
         if (connected) {
             heading(page, "Settings", 25)
             val actions = panel()
@@ -575,8 +882,12 @@ class MainActivity : Activity() {
                     .setNegativeButton("Cancel", null).show()
             }
             if (state.detailSyncAvailable) {
-                actionRow(actions, if (state.detailSyncEnabled) "Sleep and oxygen sync" else "Set up sleep and oxygen",
-                    Glyph.MOON, idle) { detailsDialog(state.detailSyncEnabled) }
+                val title = when {
+                    state.detailUsernameSet -> "QWatch username"
+                    state.detailSyncEnabled -> "Set QWatch username"
+                    else -> "Set up sleep and oxygen"
+                }
+                actionRow(actions, title, Glyph.MOON, idle) { detailsDialog(state.detailUsernameSet) }
             }
             actionRow(actions, "Disconnect", Glyph.BLUETOOTH, true) { band.disconnect() }
             block(page, actions, 9)
@@ -600,10 +911,86 @@ class MainActivity : Activity() {
                     AlertDialog.Builder(this).setTitle("Forget this band?")
                         .setMessage("Readings stay on this phone.")
                         .setNegativeButton("Cancel", null)
-                        .setPositiveButton("Forget") { _, _ -> band.forget() }.show()
+                        .setPositiveButton("Forget") { _, _ ->
+                            stopService(Intent(this, CallRelayService::class.java))
+                            band.forget()
+                        }.show()
                 }
             }
         }
+        heading(page, "Data", 24)
+        val data = panel()
+        actionRow(data, "Backup", Glyph.BACKUP, true) { go(Tab.BACKUP) }
+        block(page, data, 9)
+    }
+
+    private fun toggleCallAlerts() {
+        val service = Intent(this, CallRelayService::class.java)
+        if (app.callAlertsRunning) {
+            stopService(service)
+            return
+        }
+        if (!BandClient.hasPermissions(this)) {
+            bluetooth(PermissionAction.RECONNECT)
+            return
+        }
+        val permissions = buildList {
+            if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+                add(Manifest.permission.READ_PHONE_STATE)
+            }
+            if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        if (permissions.isEmpty()) startCallAlerts()
+        else callPermissions.launch(permissions.toTypedArray())
+    }
+
+    private fun startCallAlerts() {
+        try {
+            startForegroundService(Intent(this, CallRelayService::class.java))
+        } catch (_: IllegalStateException) {
+            app.callAlertsIssue = "Couldn’t start call alerts. Open Band and try again."
+            drawScreen(keepScroll = true)
+        } catch (_: SecurityException) {
+            permissionSettings("Phone access", "Allow phone and Bluetooth access, then turn on call alerts.")
+        }
+    }
+
+    private fun openCamera() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) go(Tab.CAMERA)
+        else cameraPermission.launch(Manifest.permission.CAMERA)
+    }
+
+    private fun permissionSettings(title: String, message: String) {
+        AlertDialog.Builder(this).setTitle(title).setMessage(message)
+            .setPositiveButton("Open settings") { _, _ ->
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName")))
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    private fun cameraScreen() {
+        val screen = column().apply { setPadding(dp(20), dp(13), dp(20), dp(12)) }
+        val bar = row()
+        bar.addView(iconButton(Glyph.LEFT, "Back to band", true) { go(Tab.BAND) }, lp(dp(48), dp(48)))
+        bar.addView(label("Wrist shutter", 24, palette.ink, "sans-serif-medium"), lp(0, -2, 1f))
+        block(screen, bar, 0)
+        val preview = PreviewView(this).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            background = shape(Color.BLACK, 15)
+            clipToOutline = true
+        }
+        screen.addView(preview, lp(-1, 0, 1f).apply { topMargin = dp(8) })
+        val status = label("", 14, palette.muted).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        val take = button("Take photo", filled = true) {}
+        val retry = button("Retry wrist shutter", filled = false) {}
+        block(screen, status, 10)
+        block(screen, retry, 4)
+        block(screen, take, 8)
+        content.removeAllViews()
+        content.addView(screen, FrameLayout.LayoutParams(-1, -1))
+        camera = BandCamera(this, band, preview, status, take, retry).also { it.resume(resumed) }
     }
 
     private fun detailsDialog(configured: Boolean) {
@@ -618,7 +1005,7 @@ class MainActivity : Activity() {
         note(fields, "Use the QWatch username already linked to this band.", 6)
         val builder = AlertDialog.Builder(this).setTitle("Sleep and oxygen sync").setView(fields)
             .setNegativeButton("Cancel", null).setPositiveButton("Save & sync", null)
-        if (configured) builder.setNeutralButton("Turn off") { _, _ -> band.setDetailUsername(null) }
+        if (configured) builder.setNeutralButton("Remove username") { _, _ -> band.setDetailUsername(null) }
         val dialog = builder.create()
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
@@ -639,9 +1026,11 @@ class MainActivity : Activity() {
             background = pressable(Color.TRANSPARENT, palette.brand, 10)
             isEnabled = enabled
             isFocusable = enabled
-            setOnClickListener { action() }
+            contentDescription = if (detail == null) title else "$title, $detail"
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+            if (enabled) setOnClickListener { action() }
             addView(Icon(this@MainActivity, glyph, if (enabled) palette.brand else palette.muted), lp(dp(22), dp(22)))
-            val words = column()
+            val words = column().apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS }
             words.addView(label(title, 16, if (enabled) palette.ink else palette.muted, "sans-serif-medium"))
             detail?.let { note(words, it, 3) }
             addView(words, lp(0, -2, 1f).apply { marginStart = dp(11) })
@@ -762,23 +1151,7 @@ class MainActivity : Activity() {
             startBluetoothAction(action)
         } else {
             permissionAction = action
-            requestPermissions(BandClient.permissions(), BLUETOOTH_REQUEST)
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != BLUETOOTH_REQUEST) return
-        val action = permissionAction
-        permissionAction = null
-        if (action != null && BandClient.hasPermissions(this)) {
-            startBluetoothAction(action)
-        } else {
-            AlertDialog.Builder(this).setTitle("Bluetooth access")
-                .setMessage("Allow Bluetooth access in Android settings to find and connect to your band.")
-                .setPositiveButton("Open settings") { _, _ ->
-                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName")))
-                }.setNegativeButton("Cancel", null).show()
+            bluetoothPermission.launch(BandClient.permissions())
         }
     }
 
@@ -787,20 +1160,10 @@ class MainActivity : Activity() {
         val manager = getSystemService(android.bluetooth.BluetoothManager::class.java)
         if (manager?.adapter?.isEnabled == false) {
             permissionAction = action
-            @Suppress("DEPRECATION")
-            startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), ENABLE_BLUETOOTH_REQUEST)
+            enableBluetooth.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             return
         }
         if (action == PermissionAction.SCAN) band.scan() else band.reconnect()
-    }
-
-    @Deprecated("Activity result for the platform Bluetooth enable prompt")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != ENABLE_BLUETOOTH_REQUEST) return
-        val action = permissionAction
-        permissionAction = null
-        if (resultCode == RESULT_OK && action != null && BandClient.hasPermissions(this)) startBluetoothAction(action)
     }
 
     private fun connectionText(state: BandState) = when (state.connection) {
@@ -810,11 +1173,13 @@ class MainActivity : Activity() {
             BandAction.IMPORTING -> "Syncing…"
             BandAction.MEASURING -> "Measuring…"
             BandAction.SETTING -> "Updating band…"
+            BandAction.CAMERA -> "Wrist shutter"
             BandAction.IDLE -> "Connected"
         }
     }
 
-    private fun metricPanel(metric: Metric, readings: List<Reading>, date: LocalDate, zone: ZoneId, value: Long?): LinearLayout {
+    private fun metricPanel(metric: Metric, readings: List<Reading>, date: LocalDate, zone: ZoneId,
+                            value: Long?, live: Boolean): LinearLayout {
         return panel().apply {
             val accent = palette.accent(metric)
             if (value == null) {
@@ -831,7 +1196,9 @@ class MainActivity : Activity() {
                     }
                 }
                 addView(numberRow, lp(-1, -2))
-                if (metric != Metric.STEPS && readings.isNotEmpty()) {
+                if (live) {
+                    note(this, "Live reading", 4)
+                } else if (!metric.isTotal && readings.isNotEmpty()) {
                     note(this, "Latest · ${TIME.format(Instant.ofEpochMilli(readings.last().time).atZone(zone))}", 4)
                 }
             }
@@ -931,17 +1298,24 @@ class MainActivity : Activity() {
         else -> "${number(value)} ${metric.unit}"
     }
     private fun number(value: Long) = NumberFormat.getIntegerInstance().format(value)
-    private fun duration(minutes: Int) =
-        if (minutes < 60) "${number(minutes.toLong())} min"
-        else "${number((minutes / 60).toLong())} hr ${number((minutes % 60).toLong())} min"
+    private fun duration(minutes: Int) = when {
+        minutes < 60 -> "${number(minutes.toLong())} min"
+        minutes % 60 == 0 -> "${number((minutes / 60).toLong())} hr"
+        else -> "${number((minutes / 60).toLong())} hr ${number((minutes % 60).toLong())} min"
+    }
     private fun dateTime(time: Long, zone: ZoneId) = DATE_TIME.format(Instant.ofEpochMilli(time).atZone(zone))
 
     companion object {
-        private const val BLUETOOTH_REQUEST = 31
-        private const val ENABLE_BLUETOOTH_REQUEST = 32
+        private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH, Tab.ACTIVITY)
+        private val HEALTH_METRICS = listOf(Metric.HEART, Metric.OXYGEN, Metric.HRV, Metric.STRESS)
+        private val ACTIVITY_METRICS = listOf(Metric.STEPS, Metric.CALORIES, Metric.DISTANCE)
         private val LONG_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL)
         private val SHORT_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)
         private val TIME = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
         private val DATE_TIME = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT)
+        private val MONTH_DAY get() = DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(
+            java.util.Locale.getDefault(), "MMMd"
+        ))
+        private val WEEKDAY = DateTimeFormatter.ofPattern("EEEEE")
     }
 }

@@ -7,7 +7,7 @@ const switches = {
 const operationLabel = {
   scan: 'Scanning…', connect: 'Connecting…', disconnect: 'Disconnecting…',
   sync: 'Syncing band…', measure: 'Measurement running…', logging: 'Updating logging…',
-  clock: 'Setting clock…', alert: 'Sending band alert…',
+  clock: 'Setting clock…',
 };
 const bandCommands = {
   scan: { action: 'scan' }, disconnect: { action: 'disconnect' },
@@ -46,9 +46,6 @@ export function mountBand({ runCommand, updateFeatures, updateDetails, backup, g
       feedback(status, device.id);
     }
   };
-  byId('notification-test').onclick = () => {
-    feedback(byId('notification-feedback'), `Test notification received at ${timestamp(Date.now())}.`);
-  };
   byId('devices').addEventListener('click', event => {
     const button = event.target.closest('button[data-id]');
     if (button) runCommand({ action: 'connect', id: button.dataset.id });
@@ -77,8 +74,12 @@ export function renderBand(state, pending) {
   byId('details-form').hidden = state.details_enabled;
   byId('details-off').hidden = !state.details_enabled;
   byId('notifications').hidden = !features.notifications;
-  byId('band-alert').hidden = !band.supports_alert;
   for (const id of [...Object.keys(bandCommands), 'reconnect', 'details-off']) byId(id).disabled = busy;
+  byId('band-alert').disabled = busy || !band.connected || !band.supports_alert;
+  const alertAvailability = !band.connected ? 'Connect your band to test vibration.'
+    : !band.supports_alert ? 'Vibration test unavailable for this band.' : null;
+  feedback(byId('notification-feedback'), band.operation === 'alert' ? 'Sending vibration command…'
+    : band.alert_message ?? alertAvailability);
   byId('details-form').querySelector('button').disabled = busy;
   for (const [id, key] of Object.entries(switches)) {
     byId(id).checked = features[key];

@@ -7,7 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.time.LocalDate
 import java.time.ZoneId
 
-class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 2) {
+class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 3) {
     data class Day(
         private val readings: Map<Metric, List<Reading>>, val sleep: SleepNight?, val earlier: Boolean
     ) {
@@ -16,8 +16,14 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         fun value(metric: Metric): Long? {
             val samples = readings(metric)
             if (samples.isEmpty()) return null
-            return if (metric == Metric.STEPS) samples.sumOf { it.value.toLong() }
+            return if (metric.isTotal) samples.sumOf { it.value.toLong() }
             else samples.last().value.toLong()
+        }
+
+        fun averageHeartRate(): Long? {
+            val samples = readings(Metric.HEART).filter { it.origin == Origin.HISTORY }
+            if (samples.isEmpty()) return null
+            return (samples.sumOf { it.value.toLong() } + samples.size / 2) / samples.size
         }
     }
     data class Checkpoint(val store: String, val cursor: Long)
@@ -42,11 +48,12 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
                 scope TEXT NOT NULL, store TEXT NOT NULL, cursor INTEGER NOT NULL)
         """.trimIndent())
         createSleepTable(db)
+        createWorkoutTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion == 1 && newVersion == 2) createSleepTable(db)
-        else error("Missing database migration from $oldVersion to $newVersion")
+        if (oldVersion < 2) createSleepTable(db)
+        if (oldVersion < 3) createWorkoutTable(db)
     }
 
     private fun createSleepTable(db: SQLiteDatabase) = db.execSQL("""
@@ -55,6 +62,52 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
             PRIMARY KEY (band, day)
         ) WITHOUT ROWID
     """.trimIndent())
+
+    private fun createWorkoutTable(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE workouts (
+                start_ms INTEGER PRIMARY KEY, type TEXT NOT NULL, band TEXT,
+                end_ms INTEGER CHECK(end_ms >= start_ms)
+            )
+        """.trimIndent())
+        db.execSQL("CREATE UNIQUE INDEX workouts_active ON workouts((1)) WHERE end_ms IS NULL")
+    }
+
+    internal fun workouts(limit: Int): WorkoutLog {
+        val db = readableDatabase
+        val active = db.workoutRows("end_ms IS NULL", 1).firstOrNull()
+        val recorded = db.workoutRows("end_ms IS NOT NULL", limit + 1)
+        return WorkoutLog(active, recorded.take(limit), recorded.size > limit)
+    }
+
+    internal fun startWorkout(type: WorkoutType, start: Long, band: String?) {
+        writableDatabase.insertWithOnConflict("workouts", null, ContentValues(3).apply {
+            put("start_ms", start)
+            put("type", type.name)
+            put("band", band)
+        }, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    internal fun endWorkout(start: Long, now: Long) {
+        writableDatabase.update("workouts", ContentValues(1).apply {
+            put("end_ms", now.coerceAtLeast(start))
+        }, "start_ms=? AND end_ms IS NULL", arrayOf(start.toString()))
+    }
+
+    private fun SQLiteDatabase.workoutRows(filter: String, limit: Int) =
+        rawQuery("""
+            SELECT start_ms, type, end_ms, (
+                SELECT round(avg(value)) FROM readings
+                WHERE band=workouts.band AND kind='HEART' AND origin='HISTORY'
+                AND time_ms>=start_ms AND time_ms<=end_ms
+            ) FROM workouts WHERE $filter ORDER BY start_ms DESC LIMIT ?
+        """.trimIndent(), arrayOf(limit.toString())).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(Workout(cursor.getLong(0), WorkoutType.valueOf(cursor.getString(1)),
+                    if (cursor.isNull(2)) null else cursor.getLong(2),
+                    if (cursor.isNull(3)) null else cursor.getInt(3)))
+            }
+        }
 
     fun save(readings: List<Reading>) {
         if (readings.isNotEmpty()) transaction { db -> readings.forEach { upsert(db, it, true) } }
@@ -74,11 +127,26 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
 
     fun day(selected: String?, date: LocalDate, zone: ZoneId): Day {
         val db = readableDatabase
-        val band = selected ?: db.rawQuery("SELECT band FROM readings ORDER BY time_ms DESC LIMIT 1", null)
+        val band = selected ?: latestBand(db)
+        return if (band == null) Day(emptyMap(), null, false) else day(db, band, date, zone)
+    }
+
+    fun week(selected: String?, date: LocalDate, zone: ZoneId): List<Pair<LocalDate, Day>> {
+        val db = readableDatabase
+        val band = selected ?: latestBand(db)
+        return (6L downTo 0).map { offset ->
+            val day = date.minusDays(offset)
+            day to if (band == null) Day(emptyMap(), null, false) else day(db, band, day, zone)
+        }
+    }
+
+    private fun latestBand(db: SQLiteDatabase) =
+        db.rawQuery("SELECT band FROM readings ORDER BY time_ms DESC LIMIT 1", null)
             .use { if (it.moveToFirst()) it.getString(0) else null }
             ?: db.rawQuery("SELECT band FROM sleep_nights ORDER BY day DESC LIMIT 1", null)
                 .use { if (it.moveToFirst()) it.getString(0) else null }
-        if (band == null) return Day(emptyMap(), null, false)
+
+    private fun day(db: SQLiteDatabase, band: String, date: LocalDate, zone: ZoneId): Day {
         val start = date.atStartOfDay(zone).toInstant().toEpochMilli().toString()
         val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli().toString()
         val rows = read(db, "band=? AND time_ms>=? AND time_ms<?", arrayOf(band, start, end), "time_ms ASC")

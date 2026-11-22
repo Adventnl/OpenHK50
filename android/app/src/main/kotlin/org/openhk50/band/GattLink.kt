@@ -162,10 +162,10 @@ internal class GattLink(private val context: Context, private val main: Handler,
         events.lost(message)
     }
 
-    fun write(packet: ByteArray, completion: (Boolean) -> Unit) {
+    fun write(packet: ByteArray, withResponse: Boolean = false, completion: (Boolean) -> Unit) {
         val current = session
         if (current == null || !current.isReady) completion(false)
-        else current.sendUart(packet, completion)
+        else current.sendUart(packet, withResponse, completion)
     }
 
     fun prepareDetails(completion: (Boolean) -> Unit) =
@@ -264,20 +264,24 @@ internal class GattLink(private val context: Context, private val main: Handler,
             detailRx = null
         }
 
-        fun sendUart(packet: ByteArray, completion: (Boolean) -> Unit) = send(tx, packet, completion)
+        fun sendUart(packet: ByteArray, withResponse: Boolean, completion: (Boolean) -> Unit) =
+            send(tx, packet, completion, withResponse)
 
         fun sendDetail(packet: ByteArray, completion: (Boolean) -> Unit) {
             if (!detailSubscribed || packet.size > getMtu() - 3) completion(false)
             else send(detailTx, packet, completion)
         }
 
-        private fun send(outgoing: BluetoothGattCharacteristic?, packet: ByteArray, completion: (Boolean) -> Unit) {
+        private fun send(outgoing: BluetoothGattCharacteristic?, packet: ByteArray, completion: (Boolean) -> Unit,
+                         withResponse: Boolean = false) {
             if (outgoing == null) {
                 completion(false)
                 return
             }
-            val type = if (outgoing.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            val canConfirm = outgoing.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            val withoutResponse = outgoing.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+            val type = if ((withResponse && canConfirm) || !withoutResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             writeCharacteristic(outgoing, packet, type).timeout(4_000)
                 .done { if (session == this) completion(true) }
                 .fail { _, _ -> if (session == this) completion(false) }

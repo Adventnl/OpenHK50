@@ -12,9 +12,12 @@ enum class Metric(val intervalValues: IntRange, val liveType: Int? = null) {
     STEPS(0..65534),
     OXYGEN(1..100, 3),
     STRESS(1..100, 8),
-    HRV(1..254);
+    HRV(1..254),
+    CALORIES(0..65534),
+    DISTANCE(0..65534);
 
     val backedUp get() = this == HEART || this == STEPS
+    val isTotal get() = this == STEPS || this == CALORIES || this == DISTANCE
 }
 enum class Origin { HISTORY, LIVE }
 

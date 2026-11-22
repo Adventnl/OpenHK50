@@ -1,5 +1,8 @@
+use super::frames::MESSAGE_PUSH;
 use crate::model::Device;
 use anyhow::{Context, Result, anyhow, bail, ensure};
+#[cfg(target_vendor = "apple")]
+use btleplug::api::RetrievePeripheralsOptions;
 use btleplug::{
     api::{
         Central, CentralState, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
@@ -19,6 +22,9 @@ const DETAIL_WRITE: Uuid = uuid!("de5bf72a-d711-4e47-af26-65e3012a5dc7");
 const DETAIL_NOTIFY: Uuid = uuid!("de5bf729-d711-4e47-af26-65e3012a5dc7");
 const IMMEDIATE_ALERT: Uuid = uuid!("00001802-0000-1000-8000-00805f9b34fb");
 const ALERT_LEVEL: Uuid = uuid!("00002a06-0000-1000-8000-00805f9b34fb");
+const DEVICE_INFORMATION: Uuid = uuid!("0000180a-0000-1000-8000-00805f9b34fb");
+const FIRMWARE_REVISION: Uuid = uuid!("00002a26-0000-1000-8000-00805f9b34fb");
+const HK50_MESSAGE_ALERT_FIRMWARE: &[u8] = b"HK50_1.00.09_260827";
 
 pub struct Radio {
     adapter: Option<Adapter>,
@@ -110,7 +116,7 @@ impl Radio {
             .collect())
     }
 
-    pub async fn connect(&mut self, id: Uuid) -> Result<Device> {
+    pub async fn connect(&mut self, id: Uuid, saved: Option<Device>) -> Result<Device> {
         ensure!(
             self.link.is_none(),
             "Disconnect the current band before connecting."
@@ -118,9 +124,23 @@ impl Radio {
         if !self.candidates.iter().any(|(device, _)| device.id == id) {
             self.scan().await?;
         }
-        let (device, peripheral) = self.candidates.iter().find(|(device, _)| device.id == id)
-            .cloned().context("Band unavailable. Bring it closer and release it from other apps, then scan again.")?;
-        let result = timeout(Duration::from_secs(15), Link::connect(peripheral.clone())).await;
+        let candidate = self
+            .candidates
+            .iter()
+            .find(|(device, _)| device.id == id)
+            .cloned();
+        let candidate = match (candidate, saved) {
+            (None, Some(saved)) => self.retrieve_saved(saved).await?,
+            (candidate, _) => candidate,
+        };
+        let (device, peripheral) = candidate.context(
+            "Band unavailable. Bring it closer and release it from other apps, then scan again.",
+        )?;
+        let result = timeout(
+            Duration::from_secs(15),
+            Link::connect(peripheral.clone(), &device.name),
+        )
+        .await;
         match result {
             Ok(Ok(link)) => {
                 self.link = Some(link);
@@ -138,6 +158,23 @@ impl Radio {
         }
     }
 
+    #[cfg(target_vendor = "apple")]
+    async fn retrieve_saved(&mut self, device: Device) -> Result<Option<(Device, Peripheral)>> {
+        let adapter = self.adapter().await?;
+        let options = RetrievePeripheralsOptions {
+            identifiers: Some(vec![device.id.into()]),
+            ..Default::default()
+        };
+        let peripherals =
+            bounded(async { Ok(adapter.retrieve_peripherals(options).await?) }).await?;
+        Ok(peripherals.into_iter().next().map(|link| (device, link)))
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    async fn retrieve_saved(&mut self, _device: Device) -> Result<Option<(Device, Peripheral)>> {
+        Ok(None)
+    }
+
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(link) = self.link.take() {
             bounded(async { Ok(link.peripheral.disconnect().await?) }).await?;
@@ -151,12 +188,17 @@ pub struct Link {
     incoming: Pin<Box<dyn Stream<Item = ValueNotification> + Send>>,
     uart: Characteristic,
     quality: Option<(Characteristic, Characteristic)>,
-    alert: Option<Characteristic>,
+    alert: Option<Alert>,
     detail_subscribed: bool,
 }
 
+enum Alert {
+    Message,
+    Immediate(Characteristic),
+}
+
 impl Link {
-    async fn connect(peripheral: Peripheral) -> Result<Self> {
+    async fn connect(peripheral: Peripheral, name: &str) -> Result<Self> {
         peripheral
             .connect()
             .await
@@ -189,14 +231,28 @@ impl Link {
                     .find(|c| c.uuid == DETAIL_NOTIFY && notifies(c)),
             )
             .map(|(tx, rx)| (tx.clone(), rx.clone()));
-        let alert = chars
+        let mut alert = chars
             .iter()
             .find(|c| {
                 c.service_uuid == IMMEDIATE_ALERT
                     && c.uuid == ALERT_LEVEL
                     && c.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
             })
-            .cloned();
+            .cloned()
+            .map(Alert::Immediate);
+        if alert.is_none()
+            && name.to_ascii_uppercase().starts_with("HK50")
+            && let Some(revision) = chars.iter().find(|c| {
+                c.service_uuid == DEVICE_INFORMATION
+                    && c.uuid == FIRMWARE_REVISION
+                    && c.properties.contains(CharPropFlags::READ)
+            })
+            && let Ok(Ok(firmware)) =
+                timeout(Duration::from_secs(3), peripheral.read(revision)).await
+            && firmware == HK50_MESSAGE_ALERT_FIRMWARE
+        {
+            alert = Some(Alert::Message);
+        }
         Ok(Self {
             peripheral,
             incoming,
@@ -223,7 +279,7 @@ impl Link {
     }
 
     pub async fn write_uart(&mut self, bytes: &[u8]) -> Result<()> {
-        self.write(&self.uart.clone(), bytes).await
+        write(&self.peripheral, &self.uart, bytes, write_type(&self.uart)).await
     }
 
     pub async fn subscribe_details(&mut self) -> Result<()> {
@@ -243,28 +299,31 @@ impl Link {
             .quality
             .as_ref()
             .context("Sleep and oxygen history are unavailable on this band.")?;
-        self.write(&tx.clone(), bytes).await
+        write(&self.peripheral, tx, bytes, write_type(tx)).await
     }
 
     pub async fn alert(&mut self) -> Result<()> {
-        let alert = self.alert.clone().context("Band alerts are unavailable.")?;
-        self.write(&alert, &[1]).await?;
-        sleep(Duration::from_millis(700)).await;
-        self.write(&alert, &[0]).await
-    }
-
-    async fn write(&mut self, target: &Characteristic, bytes: &[u8]) -> Result<()> {
-        let mode = if target
-            .properties
-            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+        match self
+            .alert
+            .as_ref()
+            .context("Band alerts are unavailable.")?
         {
-            WriteType::WithoutResponse
-        } else {
-            WriteType::WithResponse
-        };
-        bounded(async { Ok(self.peripheral.write(target, bytes, mode).await?) })
-            .await
-            .context("Couldn’t send to the band. Reconnect and try again.")
+            Alert::Message => {
+                let reply = self
+                    .request(MESSAGE_PUSH, b"\x01\x01\x01Test", Duration::from_secs(3))
+                    .await?;
+                ensure!(
+                    reply.first().is_some_and(|frame| frame[1] == 0),
+                    "Band didn’t confirm the vibration command. Reconnect and try again."
+                );
+                Ok(())
+            }
+            Alert::Immediate(alert) => {
+                write(&self.peripheral, alert, &[1], WriteType::WithoutResponse).await?;
+                sleep(Duration::from_millis(700)).await;
+                write(&self.peripheral, alert, &[0], WriteType::WithoutResponse).await
+            }
+        }
     }
 
     pub fn drain(&mut self) {
@@ -297,9 +356,28 @@ pub enum Channel {
     Detail,
 }
 
+async fn write(
+    peripheral: &Peripheral,
+    target: &Characteristic,
+    bytes: &[u8],
+    mode: WriteType,
+) -> Result<()> {
+    bounded(async { Ok(peripheral.write(target, bytes, mode).await?) })
+        .await
+        .context("Couldn’t send to the band. Reconnect and try again.")
+}
+
 fn writable(c: &Characteristic) -> bool {
     c.properties
         .intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE)
+}
+
+fn write_type(c: &Characteristic) -> WriteType {
+    if c.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
+        WriteType::WithoutResponse
+    } else {
+        WriteType::WithResponse
+    }
 }
 
 fn notifies(c: &Characteristic) -> bool {

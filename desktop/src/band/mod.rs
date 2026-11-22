@@ -79,6 +79,7 @@ pub struct Status {
     pub operation: Option<Operation>,
     pub last_sync: Option<i64>,
     pub message: Option<String>,
+    pub alert_message: Option<String>,
     pub live: Option<Live>,
     #[serde(skip)]
     pub stop: Option<Arc<Notify>>,
@@ -91,6 +92,7 @@ impl Status {
         self.charging = false;
         self.supports_details = false;
         self.supports_alert = false;
+        self.alert_message = None;
     }
 }
 
@@ -125,9 +127,14 @@ impl App {
         } else {
             if operation == Operation::Alert {
                 ensure!(
-                    self.db().features()?.notifications && status.supports_alert,
-                    "Band alerts are unavailable."
+                    self.db().features()?.notifications,
+                    "Enable the vibration test in Settings."
                 );
+                ensure!(
+                    status.supports_alert,
+                    "This band does not support the vibration test."
+                );
+                status.alert_message = None;
             }
             None
         };
@@ -136,7 +143,9 @@ impl App {
         }
         status.stop = stop.clone();
         status.operation = Some(operation);
-        status.message = None;
+        if operation != Operation::Alert {
+            status.message = None;
+        }
         drop(status);
         let app = self.clone();
         tokio::spawn(async move {
@@ -159,13 +168,18 @@ impl App {
         if disconnected {
             status.disconnected();
         }
-        status.message = match result {
+        let message = match result {
             Ok(message) => message,
             Err(error) => {
                 eprintln!("Band operation: {error:#}");
                 Some(error.to_string())
             }
         };
+        if status.operation == Some(Operation::Alert) {
+            status.alert_message = message;
+        } else {
+            status.message = message;
+        }
         status.operation = None;
         status.stop = None;
         status.live = None;
@@ -248,7 +262,8 @@ async fn run(
             return Ok(message);
         }
         Command::Connect { id } => {
-            let device = radio.connect(id).await?;
+            let saved = app.band().device.clone().filter(|device| device.id == id);
+            let device = radio.connect(id, saved).await?;
             let saved = app.db().set("device", &device);
             if let Err(error) = saved {
                 let _ = radio.disconnect().await;
@@ -344,7 +359,7 @@ async fn run(
         }
         Command::Alert => {
             link.alert().await?;
-            Ok(Some("Band alert sent.".to_owned()))
+            Ok(Some("Vibration command sent.".to_owned()))
         }
         Command::Scan | Command::Connect { .. } | Command::Disconnect => unreachable!(),
     }

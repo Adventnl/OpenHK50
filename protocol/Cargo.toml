@@ -9,7 +9,7 @@ name = "openh_k50_protocol"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-android = ["dep:jni"]
+android = ["dep:jni", "activity"]
 activity = []
 backup = ["dep:serde"]
 

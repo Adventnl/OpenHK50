@@ -134,11 +134,8 @@
         </section>
 
         <section id="notifications" class="panel" aria-labelledby="notification-title">
-          <div class="panel-heading"><h2 id="notification-title">Notifications</h2></div>
-          <div class="button-row">
-            <button id="notification-test" type="button">Simulate Android notification</button>
-            <button id="band-alert" type="button" hidden>Send band alert</button>
-          </div>
+          <div class="panel-heading"><h2 id="notification-title">Band alert</h2></div>
+          <button id="band-alert" type="button" disabled>Test vibration</button>
           <p id="notification-feedback" class="feedback" role="status" hidden></p>
         </section>
 
@@ -147,7 +144,7 @@
           <div class="setting-list">
             <label><span>Auto-sync</span><input id="auto-sync" type="checkbox" role="switch"></label>
             <label><span>Workouts</span><input id="show-workouts" type="checkbox" role="switch"></label>
-            <label><span>Notification test</span><input id="show-notifications" type="checkbox" role="switch"></label>
+            <label><span>Vibration test</span><input id="show-notifications" type="checkbox" role="switch"></label>
             <label><span>Extra health metrics</span><input id="show-extras" type="checkbox" role="switch"></label>
           </div>
           <details>

@@ -18,6 +18,8 @@ class OpenHkApp : Application() {
     internal val settings by lazy { BackupSettings(this) }
     internal val backup by lazy { BackupSync(health, settings, ::notifyChanged) }
     internal var changed: (() -> Unit)? = null
+    internal var callAlertsRunning = false
+    internal var callAlertsIssue: String? = null
     internal var storageIssue: String? = null
         private set
 
@@ -26,17 +28,17 @@ class OpenHkApp : Application() {
             { band, nights -> write { health.saveSleep(band, nights) } })
     }
 
-    private fun write(save: () -> Unit) {
+    internal fun write(issue: String = "Couldn’t save readings. Check phone storage and sync again.", save: () -> Unit) {
         databaseThread.execute {
             try {
                 save()
                 storageIssue = null
             } catch (_: SQLiteException) {
-                storageIssue = "Couldn’t save readings. Check phone storage and sync again."
+                storageIssue = issue
             }
             notifyChanged()
         }
     }
 
-    private fun notifyChanged() { main.post { changed?.invoke() } }
+    internal fun notifyChanged() { main.post { changed?.invoke() } }
 }

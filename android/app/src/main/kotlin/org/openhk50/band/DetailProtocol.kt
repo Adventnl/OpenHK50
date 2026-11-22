@@ -97,12 +97,20 @@ internal object DetailProtocol {
         return nights
     }
 
-    fun oxygen(body: ByteArray, day: Int): IntArray? {
-        if (body.size != 49 || body.u8(0) != (-day and 255)) return null
-        return (0..23).mapNotNull { hour ->
-            val maximum = body.u8(2 + hour * 2)
-            maximum.takeIf { it in 1..100 }?.let { (hour * 60 shl 16) or it }
-        }.toIntArray()
+    fun oxygen(body: ByteArray, days: Int): Map<Int, IntArray> {
+        val recordSize = 49
+        if (body.isEmpty() || body.size % recordSize != 0) return emptyMap()
+        return buildMap {
+            for (start in body.indices step recordSize) {
+                // HK50 replies use positive day offsets; H59 replies can echo the signed request.
+                val day = kotlin.math.abs(body[start].toInt())
+                if (day !in 0 until days) continue
+                put(day, (0..23).mapNotNull { hour ->
+                    val maximum = body.u8(start + 2 + hour * 2)
+                    maximum.takeIf { it in 1..100 }?.let { (hour * 60 shl 16) or it }
+                }.toIntArray())
+            }
+        }
     }
 
     private fun ByteArray.u8(index: Int) = this[index].toInt() and 255

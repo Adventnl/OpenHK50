@@ -20,9 +20,9 @@ internal class DetailTransfer(
     private var responseType = -1
     private var response: ((ByteArray) -> Boolean)? = null
     private var gotSleep = false
-    private var oxygenDays = 0
+    private val oxygenDays = mutableSetOf<Int>()
 
-    fun start(username: String) {
+    fun start(username: String?) {
         val failure = "Couldn’t start sleep and oxygen sync. Reconnect and try again."
         after(10_000) { finish(failure) }
         link.prepareDetails { ready ->
@@ -30,10 +30,12 @@ internal class DetailTransfer(
             clearWait()
             if (!ready) {
                 finish(failure)
-            } else {
+            } else if (username != null) {
                 sendSetup(DetailProtocol.login(username)) {
                     sendSetup(DetailProtocol.packet(DetailProtocol.INITIALIZE)) { readSleep() }
                 }
+            } else {
+                readSleep()
             }
         }
     }
@@ -59,22 +61,25 @@ internal class DetailTransfer(
     }
 
     private fun readOxygen(day: Int) {
-        if (day >= days || (day == 1 && oxygenDays == 0)) {
+        if (day >= days) {
             finish(when {
-                gotSleep && oxygenDays == days -> null
+                gotSleep && oxygenDays.size == days -> null
                 gotSleep -> "Some blood oxygen history didn’t reply."
-                oxygenDays > 0 -> "Sleep history didn’t reply."
-                else -> "No sleep or oxygen reply. Check your QWatch username."
+                oxygenDays.isNotEmpty() -> "Sleep history didn’t reply."
+                else -> "No sleep or blood oxygen history replied. Sync again."
             })
             return
         }
+        if (day in oxygenDays) {
+            readOxygen(day + 1)
+            return
+        }
         request(DetailProtocol.OXYGEN, byteArrayOf((-day).toByte()), { body ->
-            val intervals = DetailProtocol.oxygen(body, day)
-            if (intervals != null) {
-                oxygenDays++
-                oxygen(today.minusDays(day.toLong()), intervals)
+            val records = DetailProtocol.oxygen(body, days)
+            for ((offset, intervals) in records) {
+                if (oxygenDays.add(offset)) oxygen(today.minusDays(offset.toLong()), intervals)
             }
-            intervals != null
+            day in records
         }) { readOxygen(day + 1) }
     }
 
@@ -133,6 +138,6 @@ internal class DetailTransfer(
 
     private fun finish(message: String?) {
         cancel()
-        done(gotSleep || oxygenDays > 0, message)
+        done(gotSleep || oxygenDays.isNotEmpty(), message)
     }
 }

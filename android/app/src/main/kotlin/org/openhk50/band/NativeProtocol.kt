@@ -14,10 +14,16 @@ internal object NativeProtocol {
     const val STEPS = 67
     const val LIVE = 105
     const val LIVE_STOP = 106
+    const val CAMERA = 2
+    const val FIND_DEVICE = 80
+    const val PHONE_ALERT = 114
+
+    data class ActivityInterval(val minute: Int, val steps: Int, val calories: Int, val distance: Int)
 
     private external fun encode(command: Int, payload: ByteArray): ByteArray
     external fun header(frame: ByteArray): Int
-    private external fun history(frames: ByteArray, date: Int): IntArray
+    private external fun history(frames: ByteArray): IntArray
+    private external fun activityHistory(frames: ByteArray, date: Int): IntArray
 
     fun packet(command: Int, vararg payload: Int) =
         encode(command, ByteArray(payload.size) { payload[it].toByte() })
@@ -47,10 +53,17 @@ internal object NativeProtocol {
         return values.map { (minute, value) -> (minute shl 16) or value }.toIntArray()
     }
 
-    fun intervals(frames: List<ByteArray>, day: LocalDate?): IntArray {
-        if (frames.isEmpty()) return IntArray(0)
-        val bytes = ByteArray(frames.size * 16)
+    fun heartIntervals(frames: List<ByteArray>): IntArray = history(flatten(frames))
+
+    fun activityIntervals(frames: List<ByteArray>, day: LocalDate): List<ActivityInterval> {
+        val date = day.year * 10_000 + day.monthValue * 100 + day.dayOfMonth
+        val values = activityHistory(flatten(frames), date)
+        return (0 until values.size step 4).map { i ->
+            ActivityInterval(values[i], values[i + 1], values[i + 2], values[i + 3])
+        }
+    }
+
+    private fun flatten(frames: List<ByteArray>) = ByteArray(frames.size * 16).also { bytes ->
         frames.forEachIndexed { index, frame -> frame.copyInto(bytes, index * 16) }
-        return history(bytes, day?.let { it.year * 10_000 + it.monthValue * 100 + it.dayOfMonth } ?: 0)
     }
 }

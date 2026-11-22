@@ -10,6 +10,7 @@ pub const STRESS: u8 = 55;
 pub const HRV: u8 = 57;
 pub const LIVE: u8 = 105;
 pub const LIVE_STOP: u8 = 106;
+pub const MESSAGE_PUSH: u8 = 0x72;
 
 pub struct Reply {
     frames: Vec<u8>,

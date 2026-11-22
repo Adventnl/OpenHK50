@@ -29,13 +29,13 @@ internal data class Palette(
 ) {
     companion object {
         fun of(night: Boolean) = if (night) Palette(
-            color("#15151D"), color("#20212C"), color("#F4F3FC"), color("#B2B2C6"), color("#363849"),
-            color("#BABDFF"), color("#1D2050"), color("#2A2D4D"), color("#FF92AB"), color("#FFBE83"),
-            color("#8ADCED"), color("#E2AAF4"), color("#A4DABB"), color("#FFAA9E"), true
+            color("#111917"), color("#1B2623"), color("#F0F6F1"), color("#AEBCB5"), color("#3B4A45"),
+            color("#C9EDA0"), color("#1B3010"), color("#263A2C"), color("#FFA29C"), color("#F6C382"),
+            color("#8CDADC"), color("#DBB9F0"), color("#B9D89C"), color("#FFAB94"), true
         ) else Palette(
-            color("#F3F3F9"), Color.WHITE, color("#181923"), color("#595D70"), color("#E0E1EC"),
-            color("#363CA2"), Color.WHITE, color("#E8E9FF"), color("#A92450"), color("#925016"),
-            color("#146A7C"), color("#802B88"), color("#28684C"), color("#9D363A"), false
+            color("#F1F3EB"), color("#FCFDF8"), color("#15251F"), color("#4E6058"), color("#CED8CC"),
+            color("#305535"), Color.WHITE, color("#DCEAD6"), color("#A43538"), color("#854B18"),
+            color("#16636B"), color("#754685"), color("#3B642A"), color("#9A3B2E"), false
         )
 
         private fun color(hex: String) = Color.parseColor(hex)
@@ -48,6 +48,8 @@ internal fun Palette.accent(metric: Metric) = when (metric) {
     Metric.OXYGEN -> oxygen
     Metric.STRESS -> stress
     Metric.HRV -> hrv
+    Metric.CALORIES -> steps
+    Metric.DISTANCE -> hrv
 }
 
 internal val Metric.title get() = when (this) {
@@ -56,6 +58,8 @@ internal val Metric.title get() = when (this) {
     Metric.OXYGEN -> "Blood oxygen"
     Metric.STRESS -> "Stress"
     Metric.HRV -> "Heart rate variability"
+    Metric.CALORIES -> "Band calories"
+    Metric.DISTANCE -> "Distance"
 }
 
 internal val Metric.unit get() = when (this) {
@@ -64,6 +68,8 @@ internal val Metric.unit get() = when (this) {
     Metric.OXYGEN -> "%"
     Metric.STRESS -> ""
     Metric.HRV -> "ms"
+    Metric.CALORIES -> "kcal"
+    Metric.DISTANCE -> "m"
 }
 
 internal val Metric.icon get() = when (this) {
@@ -72,6 +78,8 @@ internal val Metric.icon get() = when (this) {
     Metric.OXYGEN -> Glyph.DROP
     Metric.STRESS -> Glyph.WAVE
     Metric.HRV -> Glyph.VARIABILITY
+    Metric.CALORIES -> Glyph.WAVE
+    Metric.DISTANCE -> Glyph.WALK
 }
 
 internal val SleepStage.title get() = when (this) {
@@ -103,7 +111,7 @@ internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = 
 
 internal enum class Glyph {
     PULSE, CALENDAR, BAND, BACKUP, WALK, BATTERY, LEFT, RIGHT, DOWN, BLUETOOTH, CHECK, CLOCK,
-    DROP, WAVE, VARIABILITY, SCAN, MOON
+    DROP, WAVE, VARIABILITY, SCAN, MOON, TODAY, CAMERA, PHONE
 }
 
 internal class Icon(context: Context, private val glyph: Glyph, private val color: Int) : View(context) {
@@ -135,6 +143,17 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
             canvas.drawRoundRect(l, t, r, b, radius, radius, paint)
 
         when (glyph) {
+            Glyph.TODAY -> {
+                rect(4f, 4f, 20f, 20f)
+                path(4f, 11f, 20f, 11f)
+                path(11f, 11f, 11f, 20f)
+            }
+            Glyph.CAMERA -> {
+                path(3f, 7f, 8f, 7f, 9f, 5f, 15f, 5f, 16f, 7f, 21f, 7f, 21f, 19f, 3f, 19f, 3f, 7f)
+                canvas.drawCircle(12f, 13f, 3.25f, paint)
+            }
+            Glyph.PHONE -> path(5f, 4f, 9f, 4f, 10f, 9f, 8f, 10f, 10f, 14f, 14f, 16f, 15f, 14f,
+                20f, 15f, 20f, 19f, 17f, 20f, 12f, 18f, 7f, 14f, 4f, 8f, 5f, 4f)
             Glyph.PULSE -> path(2f, 12f, 7f, 12f, 9.6f, 5f, 13.2f, 19f, 16.1f, 10f, 18f, 12f, 22f, 12f)
             Glyph.CALENDAR -> {
                 rect(3f, 5f, 21f, 21f)
@@ -215,6 +234,74 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
     }
 }
 
+internal class WeekChart(
+    context: Context,
+    private val palette: Palette,
+    private val accent: Int,
+    private val days: List<String>,
+    private val values: List<Long?>,
+    private val bars: Boolean
+) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
+    private val observed = values.filterNotNull()
+    private val low = if (bars) 0L else (observed.minOrNull()?.minus(5) ?: 0).coerceAtLeast(0)
+    private val high = maxOf(low + 10, (observed.maxOrNull() ?: 0) + if (bars) 0 else 5)
+
+    init {
+        // The dated rows below give TalkBack the same readings and allow drill-down.
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val top = context.dp(9).toFloat()
+        val bottom = height - context.dp(24).toFloat()
+        if (bottom <= top || days.isEmpty()) return
+        val step = width.toFloat() / days.size
+        paint.strokeWidth = context.dp(1).toFloat()
+        paint.style = Paint.Style.FILL
+        paint.color = palette.border
+        for (line in 0..2) {
+            val y = top + (bottom - top) * line / 2
+            canvas.drawLine(0f, y, width.toFloat(), y, paint)
+        }
+
+        paint.textSize = android.util.TypedValue.applyDimension(
+            android.util.TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics
+        )
+        paint.textAlign = Paint.Align.CENTER
+        path.reset()
+        var previous = false
+        days.forEachIndexed { index, day ->
+            val x = step * (index + .5f)
+            paint.color = palette.muted
+            canvas.drawText(day, x, height - context.dp(4).toFloat(), paint)
+            val value = values[index]
+            if (value == null) {
+                previous = false
+            } else {
+                val y = bottom - (bottom - top) * (value - low).toFloat() / (high - low)
+                paint.color = accent
+                if (bars) {
+                    val half = step * .23f
+                    val radius = context.dp(2).toFloat()
+                    canvas.drawRoundRect(x - half, minOf(y, bottom - radius), x + half, bottom, radius, radius, paint)
+                } else {
+                    if (previous) path.lineTo(x, y) else path.moveTo(x, y)
+                    canvas.drawCircle(x, y, context.dp(3).toFloat(), paint)
+                }
+                previous = true
+            }
+        }
+        if (!bars) {
+            paint.color = accent
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = context.dp(2).toFloat()
+            canvas.drawPath(path, paint)
+        }
+    }
+}
+
 internal class SleepTimeline(context: Context, palette: Palette, segments: List<SleepSegment>) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val cuts = segments.map { it.minutes to palette.sleepColor(it.stage) }
@@ -243,13 +330,13 @@ internal class SeriesChart(
     private val labels = RectF()
     private val start = date.atStartOfDay(zone).toInstant().toEpochMilli()
     private val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
-    private val low = if (metric == Metric.STEPS) 0 else (floor((readings.minOf { it.value } - 5) / 10.0) * 10)
+    private val low = if (metric.isTotal) 0 else (floor((readings.minOf { it.value } - 5) / 10.0) * 10)
         .toInt().coerceAtLeast(0)
-    private val high = if (metric == Metric.STEPS) maxOf(10, (ceil(readings.maxOf { it.value } / 10.0) * 10).toInt())
+    private val high = if (metric.isTotal) maxOf(10, (ceil(readings.maxOf { it.value } / 10.0) * 10).toInt())
         else maxOf(low + 20, (ceil((readings.maxOf { it.value } + 5) / 10.0) * 10).toInt())
 
     init {
-        val name = if (metric == Metric.STEPS) "Steps per 15 minutes" else "${metric.title} ${metric.unit}".trimEnd()
+        val name = if (metric.isTotal) "${metric.title} per 15 minutes" else "${metric.title} ${metric.unit}".trimEnd()
         contentDescription = "$name, ${readings.size} readings. Low ${readings.minOf { it.value }}, high ${readings.maxOf { it.value }}."
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
     }
@@ -257,7 +344,7 @@ internal class SeriesChart(
     override fun onDraw(canvas: Canvas) {
         val density = resources.displayMetrics.density
         val left = 2f * density
-        val right = width - 32f * density
+        val right = width - 43f * density
         val top = 12f * density
         val bottom = height - 26f * density
         if (right <= left || bottom <= top) return
@@ -285,7 +372,7 @@ internal class SeriesChart(
             canvas.drawText(label, center, height - 5f * density, paint)
         }
 
-        if (metric != Metric.STEPS) {
+        if (!metric.isTotal) {
             paint.color = palette.accent(metric)
             paint.style = Paint.Style.STROKE
             paint.strokeJoin = Paint.Join.ROUND
@@ -295,7 +382,11 @@ internal class SeriesChart(
             var previous: Reading? = null
             for (reading in readings) {
                 val last = previous
-                val gap = if (metric == Metric.HEART) 10 else 35
+                val gap = when (metric) {
+                    Metric.HEART -> 10
+                    Metric.OXYGEN -> 65
+                    else -> 35
+                }
                 if (last == null || reading.time - last.time > gap * 60_000) path.moveTo(x(reading.time), y(reading.value))
                 else path.lineTo(x(reading.time), y(reading.value))
                 previous = reading
@@ -304,8 +395,8 @@ internal class SeriesChart(
             paint.style = Paint.Style.FILL
             for (reading in readings) canvas.drawCircle(x(reading.time), y(reading.value), 1.9f * density, paint)
         } else {
-            paint.color = palette.steps
-            val bar = (right - left) / 96 * .76f
+            paint.color = palette.accent(metric)
+            val bar = (right - left) * (15 * 60_000f / (end - start)) * .76f
             for (reading in readings) {
                 val from = x(reading.time)
                 labels.set(from, minOf(y(reading.value), bottom - density), from + bar, bottom)

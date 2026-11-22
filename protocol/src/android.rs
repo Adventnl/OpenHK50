@@ -1,4 +1,4 @@
-use crate::{Interval, encode, heart_intervals, step_intervals, valid};
+use crate::{Interval, activity_intervals, encode, heart_intervals, valid};
 use jni::{
     JNIEnv,
     objects::{JByteArray, JObject},
@@ -45,25 +45,43 @@ extern "system" fn Java_org_openhk50_band_NativeProtocol_history(
     env: JNIEnv,
     _: JObject,
     frames: JByteArray,
+) -> jintArray {
+    let Ok(bytes) = env.convert_byte_array(frames) else {
+        return null_mut();
+    };
+    let packed = heart_intervals(&bytes)
+        .into_iter()
+        .map(|Interval { minute, value }| (jint::from(minute) << 16) | jint::from(value))
+        .collect::<Vec<_>>();
+    int_array(env, &packed).unwrap_or(null_mut())
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_org_openhk50_band_NativeProtocol_activityHistory(
+    env: JNIEnv,
+    _: JObject,
+    frames: JByteArray,
     date: jint,
 ) -> jintArray {
     let Ok(bytes) = env.convert_byte_array(frames) else {
         return null_mut();
     };
-    let intervals = if date == 0 {
-        heart_intervals(&bytes)
-    } else {
-        step_intervals(&bytes, date as u32)
-    };
-    int_array(env, intervals).unwrap_or(null_mut())
+    let packed = activity_intervals(&bytes, date as u32)
+        .into_iter()
+        .flat_map(|slot| {
+            [
+                jint::from(slot.minute),
+                slot.steps.map_or(-1, jint::from),
+                slot.calories.map_or(-1, jint::from),
+                slot.distance.map_or(-1, jint::from),
+            ]
+        })
+        .collect::<Vec<_>>();
+    int_array(env, &packed).unwrap_or(null_mut())
 }
 
-fn int_array(env: JNIEnv, values: Vec<Interval>) -> jni::errors::Result<jintArray> {
-    let packed: Vec<jint> = values
-        .into_iter()
-        .map(|reading| (jint::from(reading.minute) << 16) | jint::from(reading.value))
-        .collect();
-    let array = env.new_int_array(packed.len() as i32)?;
-    env.set_int_array_region(&array, 0, &packed)?;
+fn int_array(env: JNIEnv, values: &[jint]) -> jni::errors::Result<jintArray> {
+    let array = env.new_int_array(values.len() as i32)?;
+    env.set_int_array_region(&array, 0, values)?;
     Ok(array.into_raw())
 }

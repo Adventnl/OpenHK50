@@ -16,7 +16,7 @@ The command opens the dashboard at [127.0.0.1:8746](http://127.0.0.1:8746). On t
 
 **Start workout** estimates calories from activity, weight, and elapsed time. Use **End workout** to save it. Sessions survive browser and service restarts, and history files them under their start date. **Band calories** comes directly from the band’s activity intervals. The workout estimate is separate.
 
-**Settings** controls auto-sync, workouts, notification tests, and extra health metrics. Supported bands can sync sleep and hourly oxygen history after you enter the linked QWatch username. **Simulate Android notification** shows a test in the browser. **Send band alert** appears if the device exposes Bluetooth Immediate Alert. The Mac client has no WeChat notification integration.
+**Band alert → Test vibration** sends a short alert on supported firmware. **Settings** controls auto-sync, workouts, the vibration test, and extra health metrics. Supported bands can sync sleep and hourly oxygen history after you enter the linked QWatch username.
 
 Records live in `~/Library/Application Support/OpenHK50/health.sqlite3`. See [Mac backup setup](desktop/README.md) for the optional server connection.
 
@@ -38,12 +38,14 @@ On Windows use `gradlew.bat`; keep the Rust tools on `PATH`. The APK supports An
 ## Use the band
 
 1. On the Android phone, open **Band → Scan for bands**, allow nearby device access, and select your band, for example **HK50_3806**. Disconnect it in QWatch Pro or nRF Connect before scanning if either app is using it.
-2. Open **Today** for battery and the latest readings. Tap a metric to open **History**. Heart rate, blood oxygen, and stress offer **Measure** for the current day while the band is connected.
-3. **Band → Sync now** fetches today. **Sync past 7 days** requests recent history. For firmware exposing sleep and blood oxygen history, **Set up sleep and oxygen** uses the QWatch username already linked to the band. The app sends the username to the band over BLE and stores it on the phone.
+2. Open **Today** for battery, steps, and average heart rate. **Health** shows heart rate, oxygen, HRV, stress, and sleep stages. Tap a metric for daily readings and seven-day trends in **History**. Heart rate, oxygen, and stress also offer a spot check when connected.
+3. In **Activity**, see the band’s steps, calories, and distance. Start a workout, choose its type, and end it to save the session. The workout keeps running if you leave the app. Saved sessions show average heart rate when the selected band supplies readings from that time.
+4. **Band → Sync now** fetches today. **Sync past 7 days** requests recent history. HK50 devices with the detail channel try sleep and oxygen sync directly. For H59 or firmware that requires sign-in, enter the linked QWatch username under Band settings. The app stores the username on the phone and sends it over BLE.
+5. Under **Band tools**, **Find band** sends the vibration command. **Turn on call alerts** relays incoming cellular calls while the band service is running, including when the phone is locked. Use **Test call alert** to try the band command. In **Wrist shutter**, move your wrist or tap **Take photo**. Photos save to `Pictures/OpenHK50` on Android 10 or later and to app storage on Android 8–9.
 
-The band reconnects and syncs while the app is open. Pair in the time zone used by the band clock. **Set band clock** and **Heart-rate logging** are manual controls.
+The band reconnects and syncs while the app is open or call alerts are running. Pair in the time zone used by the band clock. **Set band clock** and **Heart-rate logging** are manual controls.
 
-The original HK50 hardware check confirmed the battery command. Other commands use the [H59 protocol reference](docs/reference/OpenH59.md) and depend on the HK50 firmware. Historical oxygen values are hourly maxima. For a manual nRF Connect check, subscribe to `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` and write the hex battery request `03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03` to `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`. In a valid `03` response the next byte is the percentage.
+The [HK50 Bluetooth reference](docs/reference/HK50.md) records verified features, gesture and vibration commands, and the GATT inventory. The [H59 protocol reference](docs/reference/OpenH59.md) covers the related firmware. Historical oxygen values are hourly maxima. For a manual nRF Connect check, subscribe to `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` and write the hex battery request `03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03` to `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`. In a valid `03` response the next byte is the percentage.
 
 Run `./gradlew :app:testDebugUnitTest :app:lintDebug` in `android/` to check the Android app. Run the Rust codec checks from the repository root with `cargo test --locked --manifest-path protocol/Cargo.toml`.
 
@@ -63,7 +65,7 @@ sudo systemctl enable --now openh-k50-sync
 
 Expose the service through a phone-reachable HTTPS reverse proxy. Use an Android-trusted certificate and keep the backend listener on loopback. The [Caddy example](server/deploy/Caddyfile.example) forwards the sync route. You can administer the Ubuntu host through Link Tunnel and inspect the backend from a paired computer with `nexus forward <ubuntu-device> 8745:127.0.0.1:8745`. The Android scheduler needs its own route to the HTTPS hostname, such as your home network or an existing private network.
 
-In **Backup → Set up backup**, enter the HTTPS origin and the key from `/etc/openh-k50/backup-key`. Android schedules heart-rate and step backups roughly hourly when network and battery policies permit. To restore those readings after reinstalling, enter the same URL and key and let **Sync now** finish. Sleep, blood oxygen, stress, and heart-rate variability are stored on the phone. Use SQLite’s `.backup` command or stop the service before taking a server database snapshot.
+In **Band → Backup → Set up backup**, enter the HTTPS origin and the key from `/etc/openh-k50/backup-key`. Android schedules heart-rate and step backups roughly hourly when network and battery policies permit. To restore those readings after reinstalling, enter the same URL and key and let **Sync now** finish. Other health readings and workouts are stored on the phone. Use SQLite’s `.backup` command or stop the service before taking a server database snapshot.
 
 ## Source layout
 
@@ -71,7 +73,7 @@ In **Backup → Set up backup**, enter the HTTPS origin and the key from `/etc/o
 - `desktop/` Rust macOS Bluetooth service, SQLite store, and browser dashboard. Android does not build or package it.
 - `protocol/` Rust BLE codec with a thin Android JNI binding. Run its checks with `cargo test --locked --manifest-path protocol/Cargo.toml`.
 - `server/` Rust sync service, SQLite storage, and Ubuntu deployment files.
-- `docs/reference/` H59 notes. The [original Python client and dashboard](https://github.com/Adventnl/OpenHK50/tree/95a879f70a023fe3e097e9a33010b9e4eddccec5) remain in Git history.
+- `docs/reference/` HK50 and H59 Bluetooth notes. The [original Python client and dashboard](https://github.com/Adventnl/OpenHK50/tree/95a879f70a023fe3e097e9a33010b9e4eddccec5) remain in Git history.
 
 Phone data stays in app-private storage. Android Keystore protects the backup key. The app uses authenticated HTTPS with your server, with no account, analytics, or vendor cloud.
 
