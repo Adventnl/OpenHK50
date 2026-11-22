@@ -5,51 +5,39 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.RectF
-import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
 import android.view.View
 import org.openhk50.data.Metric
-import org.openhk50.data.Reading
 import org.openhk50.data.SleepSegment
 import org.openhk50.data.SleepStage
-import java.time.LocalDate
-import java.time.ZoneId
 import kotlin.math.ceil
-import kotlin.math.floor
 import kotlin.math.roundToInt
 
 internal data class Palette(
     val background: Int, val surface: Int, val ink: Int, val muted: Int, val border: Int,
-    val brand: Int, val onBrand: Int, val tint: Int, val heart: Int, val steps: Int,
-    val oxygen: Int, val stress: Int, val hrv: Int, val warning: Int,
-    val night: Boolean
+    val tint: Int, val chart: Int, val night: Boolean
 ) {
+    val brand get() = if (night) 0xffb8f6ce.toInt() else 0xff136044.toInt()
+    val onBrand get() = if (night) 0xff10251a.toInt() else Color.WHITE
+    val warning get() = if (night) 0xffffba99.toInt() else 0xff8b3d23.toInt()
+    val calories get() = if (night) 0xffffa584.toInt() else 0xffa33f27.toInt()
+    val workout get() = if (night) 0xffbda9ff.toInt() else 0xff5f409d.toInt()
+    val steps get() = brand
+    val sleep get() = if (night) 0xff91c7fc.toInt() else 0xff245c8f.toInt()
+
     companion object {
         fun of(night: Boolean) = if (night) Palette(
-            color("#111917"), color("#1B2623"), color("#F0F6F1"), color("#AEBCB5"), color("#3B4A45"),
-            color("#C9EDA0"), color("#1B3010"), color("#263A2C"), color("#FFA29C"), color("#F6C382"),
-            color("#8CDADC"), color("#DBB9F0"), color("#B9D89C"), color("#FFAB94"), true
+            color("#090B0A"), color("#181C1A"), color("#F5F7F5"), color("#ADB7B1"),
+            color("#343C37"), color("#242D27"), color("#B8F6CE"), true
         ) else Palette(
-            color("#F1F3EB"), color("#FCFDF8"), color("#15251F"), color("#4E6058"), color("#CED8CC"),
-            color("#305535"), Color.WHITE, color("#DCEAD6"), color("#A43538"), color("#854B18"),
-            color("#16636B"), color("#754685"), color("#3B642A"), color("#9A3B2E"), false
+            color("#F0F4F0"), Color.WHITE, color("#14211A"), color("#4E6056"),
+            color("#D6DED8"), color("#E1EDE5"), color("#136044"), false
         )
 
         private fun color(hex: String) = Color.parseColor(hex)
     }
-}
-
-internal fun Palette.accent(metric: Metric) = when (metric) {
-    Metric.HEART -> heart
-    Metric.STEPS -> steps
-    Metric.OXYGEN -> oxygen
-    Metric.STRESS -> stress
-    Metric.HRV -> hrv
-    Metric.CALORIES -> steps
-    Metric.DISTANCE -> hrv
 }
 
 internal val Metric.title get() = when (this) {
@@ -74,11 +62,11 @@ internal val Metric.unit get() = when (this) {
 
 internal val Metric.icon get() = when (this) {
     Metric.HEART -> Glyph.PULSE
-    Metric.STEPS -> Glyph.WALK
+    Metric.STEPS -> Glyph.STEPS
     Metric.OXYGEN -> Glyph.DROP
     Metric.STRESS -> Glyph.WAVE
     Metric.HRV -> Glyph.VARIABILITY
-    Metric.CALORIES -> Glyph.WAVE
+    Metric.CALORIES -> Glyph.FLAME
     Metric.DISTANCE -> Glyph.WALK
 }
 
@@ -89,12 +77,12 @@ internal val SleepStage.title get() = when (this) {
     SleepStage.AWAKE -> "Awake"
 }
 
-internal fun Palette.sleepColor(stage: SleepStage) = when (stage) {
-    SleepStage.LIGHT -> Color.parseColor(if (night) "#8088E4" else "#727BD1")
-    SleepStage.DEEP -> Color.parseColor(if (night) "#B5A5FF" else "#493399")
-    SleepStage.REM -> Color.parseColor(if (night) "#75D7DC" else "#24929A")
-    SleepStage.AWAKE -> Color.parseColor(if (night) "#FFB192" else "#C4684D")
-}
+internal fun Palette.sleepColor(stage: SleepStage) = Color.parseColor(when (stage) {
+    SleepStage.LIGHT -> if (night) "#85B9E8" else "#4B85B9"
+    SleepStage.DEEP -> if (night) "#6579D4" else "#384B9D"
+    SleepStage.REM -> if (night) "#BEACF9" else "#8368BC"
+    SleepStage.AWAKE -> if (night) "#D2DAD4" else "#CAD3CC"
+})
 
 internal fun Context.dp(value: Number) = (value.toFloat() * resources.displayMetrics.density).roundToInt()
 
@@ -111,7 +99,7 @@ internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = 
 
 internal enum class Glyph {
     PULSE, CALENDAR, BAND, BACKUP, WALK, BATTERY, LEFT, RIGHT, DOWN, BLUETOOTH, CHECK, CLOCK,
-    DROP, WAVE, VARIABILITY, SCAN, MOON, TODAY, CAMERA, PHONE
+    DROP, WAVE, VARIABILITY, SCAN, MOON, TODAY, CAMERA, PHONE, STEPS, FLAME
 }
 
 internal class Icon(context: Context, private val glyph: Glyph, private val color: Int) : View(context) {
@@ -144,9 +132,25 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
 
         when (glyph) {
             Glyph.TODAY -> {
-                rect(4f, 4f, 20f, 20f)
-                path(4f, 11f, 20f, 11f)
-                path(11f, 11f, 11f, 20f)
+                canvas.drawArc(3f, 3f, 21f, 21f, 120f, 300f, false, paint)
+                canvas.drawArc(7f, 7f, 17f, 17f, 120f, 235f, false, paint)
+            }
+            Glyph.STEPS -> {
+                canvas.drawOval(5f, 3f, 10f, 11f, paint)
+                canvas.drawOval(14f, 11f, 19f, 19f, paint)
+                path(6f, 14f, 8f, 15f)
+                path(16f, 22f, 18f, 21f)
+            }
+            Glyph.FLAME -> {
+                lines.reset()
+                lines.moveTo(13f, 2.5f)
+                lines.cubicTo(15f, 7f, 11f, 8f, 14f, 12f)
+                lines.cubicTo(15f, 13f, 17f, 11f, 17f, 9f)
+                lines.cubicTo(24f, 17f, 16f, 23f, 11f, 21f)
+                lines.cubicTo(3f, 20f, 3f, 12f, 8f, 8f)
+                lines.cubicTo(8f, 10f, 9f, 11f, 10f, 11f)
+                lines.cubicTo(9f, 7f, 13f, 6f, 13f, 2.5f)
+                canvas.drawPath(lines, paint)
             }
             Glyph.CAMERA -> {
                 path(3f, 7f, 8f, 7f, 9f, 5f, 15f, 5f, 16f, 7f, 21f, 7f, 21f, 19f, 3f, 19f, 3f, 7f)
@@ -234,74 +238,6 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
     }
 }
 
-internal class WeekChart(
-    context: Context,
-    private val palette: Palette,
-    private val accent: Int,
-    private val days: List<String>,
-    private val values: List<Long?>,
-    private val bars: Boolean
-) : View(context) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val path = Path()
-    private val observed = values.filterNotNull()
-    private val low = if (bars) 0L else (observed.minOrNull()?.minus(5) ?: 0).coerceAtLeast(0)
-    private val high = maxOf(low + 10, (observed.maxOrNull() ?: 0) + if (bars) 0 else 5)
-
-    init {
-        // The dated rows below give TalkBack the same readings and allow drill-down.
-        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        val top = context.dp(9).toFloat()
-        val bottom = height - context.dp(24).toFloat()
-        if (bottom <= top || days.isEmpty()) return
-        val step = width.toFloat() / days.size
-        paint.strokeWidth = context.dp(1).toFloat()
-        paint.style = Paint.Style.FILL
-        paint.color = palette.border
-        for (line in 0..2) {
-            val y = top + (bottom - top) * line / 2
-            canvas.drawLine(0f, y, width.toFloat(), y, paint)
-        }
-
-        paint.textSize = android.util.TypedValue.applyDimension(
-            android.util.TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics
-        )
-        paint.textAlign = Paint.Align.CENTER
-        path.reset()
-        var previous = false
-        days.forEachIndexed { index, day ->
-            val x = step * (index + .5f)
-            paint.color = palette.muted
-            canvas.drawText(day, x, height - context.dp(4).toFloat(), paint)
-            val value = values[index]
-            if (value == null) {
-                previous = false
-            } else {
-                val y = bottom - (bottom - top) * (value - low).toFloat() / (high - low)
-                paint.color = accent
-                if (bars) {
-                    val half = step * .23f
-                    val radius = context.dp(2).toFloat()
-                    canvas.drawRoundRect(x - half, minOf(y, bottom - radius), x + half, bottom, radius, radius, paint)
-                } else {
-                    if (previous) path.lineTo(x, y) else path.moveTo(x, y)
-                    canvas.drawCircle(x, y, context.dp(3).toFloat(), paint)
-                }
-                previous = true
-            }
-        }
-        if (!bars) {
-            paint.color = accent
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = context.dp(2).toFloat()
-            canvas.drawPath(path, paint)
-        }
-    }
-}
-
 internal class SleepTimeline(context: Context, palette: Palette, segments: List<SleepSegment>) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val cuts = segments.map { it.minutes to palette.sleepColor(it.stage) }
@@ -321,87 +257,80 @@ internal class SleepTimeline(context: Context, palette: Palette, segments: List<
     }
 }
 
-internal class SeriesChart(
-    context: Context, private val palette: Palette, private val metric: Metric,
-    private val date: LocalDate, private val zone: ZoneId, private val readings: List<Reading>
+internal data class ChartPoint(val axis: String, val label: String, val value: Long?)
+
+internal class BarChart(
+    context: Context, private val palette: Palette, private val points: List<ChartPoint>,
+    description: String?, private val durationAxis: Boolean
 ) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val path = Path()
-    private val labels = RectF()
-    private val start = date.atStartOfDay(zone).toInstant().toEpochMilli()
-    private val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
-    private val low = if (metric.isTotal) 0 else (floor((readings.minOf { it.value } - 5) / 10.0) * 10)
-        .toInt().coerceAtLeast(0)
-    private val high = if (metric.isTotal) maxOf(10, (ceil(readings.maxOf { it.value } / 10.0) * 10).toInt())
-        else maxOf(low + 20, (ceil((readings.maxOf { it.value } + 5) / 10.0) * 10).toInt())
+    private val peak = points.maxOfOrNull { it.value ?: 0 } ?: 0
+    private val halfPeak = (peak / 2.0).coerceAtLeast(1.0)
+    private val magnitude = Math.pow(10.0, kotlin.math.floor(kotlin.math.log10(halfPeak)))
+    private val halfScale = if (durationAxis) {
+        listOf(15, 30, 60, 120, 180, 240, 360, 480, 720).firstOrNull { it >= halfPeak }?.toDouble() ?: numericHalfScale()
+    } else numericHalfScale()
+    private val scale = 2 * halfScale
+    private val compactNumber = java.text.NumberFormat.getInstance().apply { maximumFractionDigits = 1 }
+    private val ticks = listOf(0L, halfScale.toLong(), scale.toLong()).map(::axisNumber)
 
     init {
-        val name = if (metric.isTotal) "${metric.title} per 15 minutes" else "${metric.title} ${metric.unit}".trimEnd()
-        contentDescription = "$name, ${readings.size} readings. Low ${readings.minOf { it.value }}, high ${readings.maxOf { it.value }}."
-        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        contentDescription = description
+        importantForAccessibility = if (description == null) IMPORTANT_FOR_ACCESSIBILITY_NO else IMPORTANT_FOR_ACCESSIBILITY_YES
+    }
+
+    private fun numericHalfScale() = listOf(1, 2, 5, 10).first { it * magnitude >= halfPeak } * magnitude
+
+    private fun axisNumber(value: Long) = when {
+        durationAxis && value >= 60 -> "${compactNumber.format(value / 60.0)}h"
+        durationAxis && value > 0 -> "${compactNumber.format(value)}m"
+        value >= 1_000_000_000 -> "${compactNumber.format(value / 1_000_000_000.0)}B"
+        value >= 1_000_000 -> "${compactNumber.format(value / 1_000_000.0)}M"
+        value >= 1_000 -> "${compactNumber.format(value / 1_000.0)}k"
+        else -> compactNumber.format(value)
     }
 
     override fun onDraw(canvas: Canvas) {
-        val density = resources.displayMetrics.density
-        val left = 2f * density
-        val right = width - 43f * density
-        val top = 12f * density
-        val bottom = height - 26f * density
-        if (right <= left || bottom <= top) return
-        paint.strokeWidth = density
-        paint.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+        val top = context.dp(9).toFloat()
         paint.textSize = android.util.TypedValue.applyDimension(
             android.util.TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics
         )
-        paint.style = Paint.Style.FILL
-
-        fun x(time: Long) = left + ((time - start).toDouble() / (end - start)).toFloat() * (right - left)
-        fun y(value: Int) = bottom - (value - low).toFloat() / (high - low) * (bottom - top)
-        for (i in 0..2) {
-            val value = low + (high - low) * i / 2
-            val at = y(value)
+        val font = paint.fontMetrics
+        val bottom = height - (font.descent - font.ascent) - context.dp(8)
+        val plot = width - axisWidth()
+        if (plot <= 0 || bottom <= top || points.isEmpty()) return
+        val step = plot.toFloat() / points.size
+        paint.strokeWidth = context.dp(1).toFloat()
+        paint.textAlign = Paint.Align.LEFT
+        for (line in 0..2) {
+            val y = bottom - (bottom - top) * line / 2
             paint.color = palette.border
-            canvas.drawLine(left, at, right, at, paint)
+            canvas.drawLine(0f, y, plot.toFloat(), y, paint)
             paint.color = palette.muted
-            canvas.drawText(value.toString(), right + 5f * density, at + 4f * density, paint)
-        }
-        listOf(0, 6, 12, 18, 24).forEach { hour ->
-            val label = "%02d".format(java.util.Locale.ROOT, if (hour == 24) 0 else hour)
-            val time = if (hour == 24) end else date.atTime(hour, 0).atZone(zone).toInstant().toEpochMilli()
-            val center = (x(time) - paint.measureText(label) / 2).coerceAtLeast(left)
-            canvas.drawText(label, center, height - 5f * density, paint)
+            canvas.drawText(ticks[line], (plot + context.dp(5)).toFloat(), y - font.ascent / 2, paint)
         }
 
-        if (!metric.isTotal) {
-            paint.color = palette.accent(metric)
-            paint.style = Paint.Style.STROKE
-            paint.strokeJoin = Paint.Join.ROUND
-            paint.strokeCap = Paint.Cap.ROUND
-            paint.strokeWidth = 1.75f * density
-            path.reset()
-            var previous: Reading? = null
-            for (reading in readings) {
-                val last = previous
-                val gap = when (metric) {
-                    Metric.HEART -> 10
-                    Metric.OXYGEN -> 65
-                    else -> 35
-                }
-                if (last == null || reading.time - last.time > gap * 60_000) path.moveTo(x(reading.time), y(reading.value))
-                else path.lineTo(x(reading.time), y(reading.value))
-                previous = reading
+        paint.textAlign = Paint.Align.CENTER
+        points.forEachIndexed { index, point ->
+            val x = step * (index + .5f)
+            paint.color = palette.muted
+            if (paint.measureText(point.axis) <= step - context.dp(2)) {
+                canvas.drawText(point.axis, x, height - font.descent, paint)
             }
-            canvas.drawPath(path, paint)
-            paint.style = Paint.Style.FILL
-            for (reading in readings) canvas.drawCircle(x(reading.time), y(reading.value), 1.9f * density, paint)
-        } else {
-            paint.color = palette.accent(metric)
-            val bar = (right - left) * (15 * 60_000f / (end - start)) * .76f
-            for (reading in readings) {
-                val from = x(reading.time)
-                labels.set(from, minOf(y(reading.value), bottom - density), from + bar, bottom)
-                canvas.drawRoundRect(labels, density, density, paint)
+            point.value?.let { value ->
+                val y = bottom - (bottom - top) * (value / scale).toFloat()
+                val half = (step * .25f).coerceAtMost(context.dp(15).toFloat())
+                val radius = minOf(half, context.dp(5).toFloat())
+                paint.color = palette.chart
+                canvas.drawRoundRect(x - half, minOf(y, bottom - context.dp(2)), x + half, bottom, radius, radius, paint)
             }
         }
+    }
+
+    fun axisWidth(): Int {
+        paint.textSize = android.util.TypedValue.applyDimension(
+            android.util.TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics
+        )
+        return ceil(ticks.maxOf { paint.measureText(it) }).toInt() + context.dp(8)
     }
 }

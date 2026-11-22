@@ -42,6 +42,7 @@ data class BandState(
     val charging: Boolean = false,
     val measurement: Metric? = null,
     val liveValue: Int? = null,
+    val measurementAt: Instant? = null,
     val measurementMessage: String? = null,
     val lastSync: Long? = null,
     val detailSyncAvailable: Boolean = false,
@@ -392,7 +393,8 @@ internal class BandClient(
         liveSamples.clear()
         stopRequested = false
         closingAfterMeasurement = false
-        publish(state.copy(action = BandAction.MEASURING, measurement = metric, liveValue = null, measurementMessage = null))
+        publish(state.copy(action = BandAction.MEASURING, measurement = metric, liveValue = null,
+            measurementAt = null, measurementMessage = null))
         request(NativeProtocol.packet(LIVE, type, 1), 30_000) { result ->
             val message = when {
                 result.rejected && liveSamples.isEmpty() -> "The band couldn’t measure. Check the fit and try again."
@@ -417,19 +419,20 @@ internal class BandClient(
 
     private fun stopOnBand(metric: Metric, type: Int, message: String?) {
         val device = state.device
-        if (device != null && liveSamples.isNotEmpty()) {
+        val reading = if (device != null && liveSamples.isNotEmpty()) {
             liveSamples.sort()
             val median = (liveSamples[(liveSamples.size - 1) / 2] + liveSamples[liveSamples.size / 2]) / 2
-            save(listOf(Reading.live(device.address, metric, median, Instant.now())))
             liveSamples.clear()
-        }
+            Reading.live(device.address, metric, median, Instant.now()).also { save(listOf(it)) }
+        } else null
         request(NativeProtocol.packet(LIVE_STOP, type, 0, 0), 500) {
             if (!connectionNeeded || closingAfterMeasurement) {
                 val reopen = reopenAfterMeasurement
                 closeLink(null)
                 if (reopen) autoConnect()
             } else {
-                state = state.copy(liveValue = null, measurementMessage = message)
+                state = state.copy(liveValue = reading?.value, measurementAt = reading?.time?.let(Instant::ofEpochMilli),
+                    measurementMessage = message)
                 finish(state.message)
             }
         }

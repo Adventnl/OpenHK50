@@ -26,11 +26,14 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.TextClock
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
+import androidx.core.content.edit
+import androidx.core.graphics.ColorUtils
 import org.openhk50.OpenHkApp
 import org.openhk50.band.BandAction
 import org.openhk50.band.BandClient
@@ -39,13 +42,14 @@ import org.openhk50.band.CallRelayService
 import org.openhk50.band.Connection
 import org.openhk50.data.HealthStore
 import org.openhk50.data.Metric
-import org.openhk50.data.Origin
-import org.openhk50.data.Reading
+import org.openhk50.data.DAY_BUCKET_HOURS
+import org.openhk50.data.HistoryPeriod
 import org.openhk50.data.SleepNight
 import org.openhk50.data.SleepStage
 import org.openhk50.data.Workout
 import org.openhk50.data.WorkoutLog
 import org.openhk50.data.WorkoutType
+import org.openhk50.data.combined
 import org.openhk50.sync.BackupJob
 import java.text.NumberFormat
 import java.time.Instant
@@ -57,31 +61,40 @@ import java.time.format.FormatStyle
 
 class MainActivity : ComponentActivity() {
     private enum class Tab(val title: String, val icon: Glyph, val inNavigation: Boolean = true) {
-        TODAY("Today", Glyph.TODAY), HEALTH("Health", Glyph.PULSE), ACTIVITY("Activity", Glyph.WALK),
-        HISTORY("History", Glyph.CALENDAR), BAND("Band", Glyph.BAND),
-        BACKUP("Backup", Glyph.BACKUP, false), CAMERA("Wrist shutter", Glyph.CAMERA, false)
+        TODAY("Summary", Glyph.TODAY), ACTIVITY("Workouts", Glyph.WALK), HEALTH("Health", Glyph.PULSE),
+        BAND("Band", Glyph.BAND), HISTORY("History", Glyph.CALENDAR, false),
+        WORKOUT_TYPES("Choose workout", Glyph.WALK, false), BACKUP("Backup", Glyph.BACKUP, false),
+        CAMERA("Camera remote", Glyph.CAMERA, false), CLOCK("Phone clock", Glyph.CLOCK, false)
     }
     private enum class PermissionAction { SCAN, RECONNECT }
+    private enum class Goal(val title: String, val unit: String, val target: Int, val max: Int, val metric: Metric?) {
+        CALORIES("Band calories", "kcal", 300, 10_000, Metric.CALORIES),
+        WORKOUT("Workout time", "min", 30, 1_440, null),
+        STEPS("Steps", "steps", 8_000, 100_000, Metric.STEPS)
+    }
 
     private val app get() = application as OpenHkApp
     private val band get() = app.band
     private lateinit var palette: Palette
-    private lateinit var root: LinearLayout
+    private lateinit var root: FrameLayout
     private lateinit var content: FrameLayout
+    private lateinit var navigationShell: LinearLayout
     private lateinit var navigation: LinearLayout
     private var scroll: ScrollView? = null
     private var tab = Tab.TODAY
+    private var detailParent = Tab.TODAY
     private var historyMetric: Metric? = Metric.HEART
     private var historyDate = LocalDate.now()
-    private var historyWeek = false
-    private var shownRecords = 24
+    private var historyPeriod = HistoryPeriod.DAY
     private var currentDay: HealthStore.Day? = null
-    private var week: List<Pair<LocalDate, HealthStore.Day>> = emptyList()
+    private var trend: HealthStore.Trend? = null
+    private var summary: SummaryData? = null
     private var workouts: WorkoutLog? = null
     private var workoutBusy = false
-    private var workoutLimit = 30
+    private var workoutPage = 0
     private var workoutTimer: TextView? = null
     private var camera: BandCamera? = null
+    private var cameraPermissionPending = false
     private var resumed = false
     private val tickWorkout = object : Runnable {
         override fun run() {
@@ -94,6 +107,7 @@ class MainActivity : ComponentActivity() {
         override fun run() {
             if (tab in DAILY_TABS && lastShownDate != LocalDate.now(band.zone)) {
                 currentDay = null
+                summary = null
                 drawScreen(keepScroll = true)
                 loadData()
             }
@@ -111,6 +125,7 @@ class MainActivity : ComponentActivity() {
     private var active = false
     private var lastDevice: String? = null
     private var lastShownDate: LocalDate? = null
+    private val displayPrefs by lazy { getSharedPreferences("display", MODE_PRIVATE) }
 
     private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val action = permissionAction
@@ -132,8 +147,9 @@ class MainActivity : ComponentActivity() {
         else permissionSettings("Phone access", "Allow phone access to relay incoming calls to the band.")
     }
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) go(Tab.CAMERA)
-        else permissionSettings("Camera access", "Allow camera access to use the wrist shutter.")
+        cameraPermissionPending = false
+        if (!granted) permissionSettings("Camera access", "Allow access to the phone camera to take photos.")
+        else if (tab == Tab.BAND && phoneCameraAvailable()) go(Tab.CAMERA)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -142,11 +158,14 @@ class MainActivity : ComponentActivity() {
         palette = Palette.of(night)
         expanded = resources.configuration.screenWidthDp >= 680
         tab = savedInstanceState?.getString("tab")?.let(Tab::valueOf) ?: Tab.TODAY
-        if (tab == Tab.CAMERA && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+        detailParent = savedInstanceState?.getString("detailParent")?.let(Tab::valueOf) ?: Tab.TODAY
+        if (tab == Tab.CAMERA && (!phoneCameraAvailable() ||
+                checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)) {
             tab = Tab.BAND
         }
         historyDate = savedInstanceState?.getString("day")?.let(LocalDate::parse) ?: LocalDate.now(band.zone)
-        historyWeek = savedInstanceState?.getBoolean("historyWeek") == true
+        historyPeriod = savedInstanceState?.getString("period")?.let(HistoryPeriod::valueOf) ?: HistoryPeriod.DAY
+        workoutPage = savedInstanceState?.getInt("workoutPage") ?: 0
         historyMetric = when (val metric = savedInstanceState?.getString("metric")) {
             null -> Metric.HEART
             "SLEEP" -> null
@@ -169,14 +188,18 @@ class MainActivity : ComponentActivity() {
             if (lastDevice != device) {
                 lastDevice = device
                 currentDay = null
+                trend = null
+                summary = null
                 loadData()
             }
             if (tab in DAILY_TABS && lastShownDate != LocalDate.now(band.zone)) {
                 currentDay = null
+                summary = null
                 loadData()
             }
-            if (tab == Tab.CAMERA) camera?.update()
-            else if (tab != Tab.BACKUP) drawScreen(keepScroll = true)
+            if (tab == Tab.CAMERA) {
+                camera?.update()
+            } else if (tab == Tab.BAND) drawScreen(keepScroll = true)
         }
         band.foreground(true)
         if (app.settings.state().endpoint != null) BackupJob.schedule(this)
@@ -187,7 +210,8 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
-        camera?.resume(true)
+        if (tab == Tab.CAMERA && !phoneCameraAvailable()) go(Tab.BAND)
+        else camera?.resume(true)
     }
 
     override fun onPause() {
@@ -203,7 +227,7 @@ class MainActivity : ComponentActivity() {
         band.changed = null
         app.main.removeCallbacks(tickWorkout)
         app.main.removeCallbacks(checkDay)
-        if (!isChangingConfigurations && permissionAction == null) band.foreground(false)
+        if (!isChangingConfigurations && permissionAction == null && !cameraPermissionPending) band.foreground(false)
     }
 
     override fun onDestroy() {
@@ -214,8 +238,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("tab", tab.name)
+        outState.putString("detailParent", detailParent.name)
         outState.putString("day", historyDate.toString())
-        outState.putBoolean("historyWeek", historyWeek)
+        outState.putString("period", historyPeriod.name)
+        outState.putInt("workoutPage", workoutPage)
         outState.putString("metric", historyMetric?.name ?: "SLEEP")
         outState.putString("permission", permissionAction?.name)
         super.onSaveInstanceState(outState)
@@ -245,7 +271,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildShell() {
-        root = column().apply { setBackgroundColor(palette.background) }
+        root = FrameLayout(this).apply { setBackgroundColor(palette.background) }
         setContentView(root)
         root.setOnApplyWindowInsetsListener { view, insets ->
             if (Build.VERSION.SDK_INT >= 30) {
@@ -259,17 +285,21 @@ class MainActivity : ComponentActivity() {
             insets
         }
 
-        content = FrameLayout(this)
+        val shell = if (expanded) row() else column()
+        root.addView(shell, FrameLayout.LayoutParams(-1, -1))
+        content = FrameLayout(this).apply { setBackgroundColor(palette.background) }
         navigation = if (expanded) column() else row()
+        navigationShell = column().apply {
+            setBackgroundColor(palette.surface)
+            if (!expanded) divider(this)
+            addView(navigation, lp(-1, -2))
+        }
         if (expanded) {
-            val body = row().apply { gravity = Gravity.TOP }
-            body.addView(navigation, lp(dp(104), -1))
-            body.addView(content, lp(0, -1, 1f))
-            root.addView(body, lp(-1, 0, 1f))
+            shell.addView(navigationShell, lp(dp(100), -1))
+            shell.addView(content, lp(0, -1, 1f))
         } else {
-            root.addView(content, lp(-1, 0, 1f))
-            root.addView(View(this).apply { setBackgroundColor(palette.border) }, lp(-1, dp(1)))
-            root.addView(navigation, lp(-1, -2))
+            shell.addView(content, lp(-1, 0, 1f))
+            shell.addView(navigationShell, lp(-1, -2))
         }
         drawNavigation()
         updateBack()
@@ -277,47 +307,58 @@ class MainActivity : ComponentActivity() {
 
     private fun drawNavigation() {
         navigation.removeAllViews()
-        navigation.setPadding(dp(8), dp(6), dp(8), dp(6))
-        navigation.setBackgroundColor(if (expanded) palette.background else palette.surface)
+        navigationShell.visibility = if (tab == Tab.CAMERA || tab == Tab.CLOCK) View.GONE else View.VISIBLE
+        navigation.setPadding(dp(7), dp(if (expanded) 16 else 5), dp(7), dp(5))
         for (item in Tab.entries.filter { it.inNavigation }) {
-            val selected = item == tab || (item == Tab.BAND && backDestination() == Tab.BAND)
+            val selected = item == tab || (!tab.inNavigation && item == backDestination())
             val color = if (selected) palette.brand else palette.muted
             val cell = column().apply {
                 gravity = Gravity.CENTER
-                minimumHeight = dp(if (expanded) 74 else 54)
+                minimumHeight = dp(if (expanded) 68 else 51)
+                setPadding(dp(1), dp(5), dp(1), dp(5))
                 contentDescription = item.title
                 isSelected = selected
                 isFocusable = true
-                background = pressable(Color.TRANSPARENT, palette.ink, 13)
+                background = pressable(Color.TRANSPARENT, palette.ink, 14)
                 setOnClickListener { go(item) }
             }
-            val pill = FrameLayout(this).apply {
-                if (selected) background = shape(palette.tint, 18)
+            val capsule = FrameLayout(this).apply {
+                if (selected) background = shape(palette.tint, 16)
+                addView(Icon(this@MainActivity, item.icon, color), FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
             }
-            pill.addView(Icon(this, item.icon, color), FrameLayout.LayoutParams(dp(21), dp(21), Gravity.CENTER))
-            cell.addView(pill, lp(dp(48), dp(28)))
+            cell.addView(capsule, lp(dp(50), dp(27)))
             cell.addView(label(item.title, 12, color, if (selected) "sans-serif-medium" else "sans-serif")
-                .apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }, lp(-2, -2))
+                .apply {
+                    gravity = Gravity.CENTER
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                }, lp(-1, -2).apply { topMargin = dp(3) })
             navigation.addView(cell, if (expanded) lp(-1, -2) else lp(0, -2, 1f))
         }
     }
 
     private fun go(next: Tab) {
         if (tab == next) return
-        camera?.close()
+        val previousCamera = camera
         camera = null
+        if (next == Tab.HISTORY || next == Tab.WORKOUT_TYPES) detailParent = tab
         tab = next
+        previousCamera?.close()
         queryGeneration++
         backupMessage = null
         if (next == Tab.HISTORY || next in DAILY_TABS) currentDay = null
-        if (next == Tab.HISTORY) week = emptyList()
+        if (next == Tab.TODAY) summary = null
+        if (next == Tab.HISTORY) trend = null
         drawNavigation()
         updateBack()
         drawScreen()
         loadData()
     }
 
-    private fun backDestination() = if (tab == Tab.BACKUP || tab == Tab.CAMERA) Tab.BAND else Tab.TODAY
+    private fun backDestination() = when (tab) {
+        Tab.BACKUP, Tab.CAMERA, Tab.CLOCK -> Tab.BAND
+        Tab.HISTORY, Tab.WORKOUT_TYPES -> detailParent
+        else -> Tab.TODAY
+    }
 
     private fun updateBack() {
         if (Build.VERSION.SDK_INT >= 33) {
@@ -339,34 +380,46 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadData() {
-        if (!active || tab == Tab.BAND || tab == Tab.CAMERA) return
+        if (!active || tab in setOf(Tab.BAND, Tab.CAMERA, Tab.CLOCK, Tab.WORKOUT_TYPES)) return
         val generation = ++queryGeneration
         val address = band.state.device?.address
         val zone = band.zone
         val destination = tab
-        val trends = destination == Tab.HISTORY && historyWeek
-        val limit = workoutLimit
-        val date = if (destination == Tab.HISTORY) historyDate else LocalDate.now(zone)
+        val history = destination == Tab.HISTORY
+        val period = historyPeriod
+        val metric = historyMetric
+        val page = workoutPage
+        val today = LocalDate.now(zone)
+        val date = if (history) period.endDate(historyDate, today) else today
         app.databaseThread.execute {
             val result = runCatching {
                 DataSnapshot(
-                    day = if (destination == Tab.BACKUP || trends) null else app.health.day(address, date, zone),
-                    week = if (trends) app.health.week(address, date, zone) else emptyList(),
-                    workouts = when (destination) {
-                        Tab.TODAY -> app.health.workouts(30)
-                        Tab.ACTIVITY -> app.health.workouts(limit)
+                    day = when {
+                        destination == Tab.BACKUP || destination == Tab.ACTIVITY -> null
+                        !history -> app.health.day(address, date, zone)
+                        period == HistoryPeriod.DAY -> app.health.day(address, date, zone, metric, history = true)
                         else -> null
                     },
-                    pending = if (destination == Tab.BACKUP) app.health.pendingCount() else 0L
+                    trend = if (history && period != HistoryPeriod.DAY) {
+                        app.health.trend(address, period.dates(date), date, zone, metric)
+                    } else null,
+                    workouts = when (destination) {
+                        Tab.TODAY -> app.health.workouts(3)
+                        Tab.ACTIVITY -> app.health.workouts(WORKOUT_PAGE_SIZE, page * WORKOUT_PAGE_SIZE)
+                        else -> null
+                    },
+                    pending = if (destination == Tab.BACKUP) app.health.pendingCount() else 0L,
+                    summary = if (destination == Tab.TODAY) loadSummary(address, date, zone) else null
                 )
             }
             app.main.post {
                 if (active && generation == queryGeneration) {
-                    result.onSuccess { (day, trend, log, count) ->
+                    result.onSuccess { (day, series, log, count, overview) ->
                         currentDay = day
-                        week = trend
+                        trend = series
                         if (log != null) workouts = log
                         pendingCount = count
+                        summary = overview
                         readIssue = null
                     }.onFailure { readIssue = "Couldn’t open your records. Reopen the app to try again." }
                     drawScreen(keepScroll = true)
@@ -376,9 +429,22 @@ class MainActivity : ComponentActivity() {
     }
 
     private data class DataSnapshot(
-        val day: HealthStore.Day?, val week: List<Pair<LocalDate, HealthStore.Day>>,
-        val workouts: WorkoutLog?, val pending: Long
+        val day: HealthStore.Day?, val trend: HealthStore.Trend?,
+        val workouts: WorkoutLog?, val pending: Long, val summary: SummaryData?
     )
+
+    private data class SummaryData(
+        val previousSteps: Long?, val workoutMinutes: Long, val averageSteps: Long?, val averageSleep: Long?
+    )
+
+    private fun loadSummary(address: String?, date: LocalDate, zone: ZoneId): SummaryData {
+        val days = HistoryPeriod.WEEK.dates(date.minusDays(1))
+        val steps = app.health.trend(address, days, days.last(), zone, Metric.STEPS).buckets.map { it.value(true) }
+        val sleep = app.health.trend(address, days, days.last(), zone, null).buckets
+        val recordedSteps = steps.filterNotNull()
+        val averageSteps = recordedSteps.takeIf { it.isNotEmpty() }?.let { (it.sum() + it.size / 2) / it.size }
+        return SummaryData(steps.last(), app.health.workoutMinutes(date, zone), averageSteps, sleep.combined().value(false))
+    }
 
     private fun drawScreen(keepScroll: Boolean = false) {
         app.main.removeCallbacks(tickWorkout)
@@ -387,21 +453,24 @@ class MainActivity : ComponentActivity() {
             if (camera == null) cameraScreen()
             return
         }
+        if (tab == Tab.CLOCK) {
+            clockScreen()
+            return
+        }
         val previous = if (keepScroll) scroll?.scrollY ?: 0 else 0
-        val page = column().apply { setPadding(dp(22), dp(18), dp(22), dp(26)) }
+        val page = column().apply { setPadding(dp(18), dp(12), dp(18), dp(24)) }
         val viewport = ScrollView(this).apply {
             isFillViewport = true
             isVerticalScrollBarEnabled = false
-            clipToPadding = false
         }
         val center = FrameLayout(this)
-        val pageWidth = if (expanded) (resources.configuration.screenWidthDp - 104).coerceAtMost(696) else -1
+        val pageWidth = if (expanded) (resources.configuration.screenWidthDp - 100).coerceAtMost(680) else -1
         center.addView(page, FrameLayout.LayoutParams(if (pageWidth == -1) -1 else dp(pageWidth), -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
         viewport.addView(center, FrameLayout.LayoutParams(-1, -2))
         scroll = viewport
         content.removeAllViews()
         content.addView(viewport, FrameLayout.LayoutParams(-1, -1))
-
+        if (tab != Tab.TODAY) pageHeader(page)
         when (tab) {
             Tab.TODAY -> today(page)
             Tab.HEALTH -> health(page)
@@ -409,7 +478,8 @@ class MainActivity : ComponentActivity() {
             Tab.HISTORY -> history(page)
             Tab.BAND -> bandPage(page)
             Tab.BACKUP -> backupPage(page)
-            Tab.CAMERA -> Unit
+            Tab.WORKOUT_TYPES -> workoutTypes(page)
+            Tab.CAMERA, Tab.CLOCK -> Unit
         }
         if (previous > 0) viewport.post { viewport.scrollTo(0, previous) }
     }
@@ -417,54 +487,173 @@ class MainActivity : ComponentActivity() {
     private fun today(page: LinearLayout) {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
-        title(page, "Today", today.format(LONG_DATE))
-        block(page, connectionStrip(band.state), 16)
+        val day = currentDay
+        val header = row()
+        val name = column()
+        name.addView(screenTitle("Summary"))
+        note(name, today.format(SUMMARY_DATE), 5)
+        header.addView(name, lp(0, -2, 1f))
+        header.addView(iconButton(Glyph.CALENDAR, "Activity history", true) {
+            openHistory(Metric.STEPS, today)
+        }.apply { background = pressable(palette.surface, palette.ink, 16) }, lp(dp(48), dp(48)))
+        block(page, header, 0)
         showReadIssues(page)
 
-        val day = currentDay
-        val summaries = row().apply { gravity = Gravity.TOP }
-        summaries.addView(dailyTile("Steps", Metric.STEPS, day?.value(Metric.STEPS), today), lp(0, -1, 1f))
-        summaries.addView(dailyTile("Average heart rate", Metric.HEART, day?.averageHeartRate(), today),
-            lp(0, -1, 1f).apply { marginStart = dp(10) })
-        block(page, summaries, 20)
+        sectionHeader(page, "Activity", "Goals", 20, ::editGoals)
+        val activity = panel()
+        val values = listOf(day?.value(Metric.CALORIES), summary?.workoutMinutes, day?.value(Metric.STEPS))
+        val goals = Goal.entries.mapIndexed { index, goal ->
+            GoalProgress(values[index], displayPrefs.getInt(goal.name, goal.target), goalColor(goal))
+        }
+        val stack = resources.configuration.screenWidthDp < 360 || resources.configuration.fontScale > 1.2f
+        val layout = if (stack) column() else row()
+        val progress = column()
+        for ((index, goal) in Goal.entries.withIndex()) {
+            val reading = goals[index]
+            val item = column().apply {
+                minimumHeight = dp(50)
+                setPadding(0, dp(3), 0, dp(3))
+                background = pressable(Color.TRANSPARENT, palette.ink, 10)
+                val value = reading.value?.let(::number) ?: "—"
+                val target = number(reading.target.toLong())
+                contentDescription = "${goal.title}, ${reading.value?.let { "$value of $target ${goal.unit}" } ?: "no reading, goal $target ${goal.unit}"}"
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+                isFocusable = true
+                setOnClickListener {
+                    val metric = goal.metric
+                    if (metric == null) go(Tab.ACTIVITY) else openHistory(metric, today)
+                }
+                addView(label(goal.title, 13, palette.muted, "sans-serif-medium").ignoreAccessibility())
+                val suffix = if (goal == Goal.STEPS) " / $target" else " / $target ${goal.unit}"
+                addView(label(value + suffix, 22, reading.color, "sans-serif-medium").apply {
+                    letterSpacing = -.025f
+                    val styled = android.text.SpannableString(text)
+                    styled.setSpan(android.text.style.RelativeSizeSpan(.57f), value.length, text.length, 0)
+                    styled.setSpan(android.text.style.ForegroundColorSpan(palette.muted), value.length, text.length, 0)
+                    text = styled
+                }.ignoreAccessibility(), lp(-1, -2).apply { topMargin = dp(2) })
+            }
+            progress.addView(item, lp(-1, -2))
+        }
+        val chart = ActivityDial(this, palette, goals)
+        if (stack) {
+            layout.addView(chart, lp(dp(146), dp(146)).apply { gravity = Gravity.CENTER_HORIZONTAL })
+            layout.addView(progress, lp(-1, -2))
+        } else {
+            layout.addView(progress, lp(0, -2, 1f))
+            layout.addView(chart, lp(dp(152), dp(152)).apply { marginStart = dp(6) })
+        }
+        activity.addView(layout, lp(-1, -2))
+        divider(activity)
+        activity.addView(summaryRow(Metric.DISTANCE, day?.value(Metric.DISTANCE)) {
+            openHistory(Metric.DISTANCE, today)
+        }, lp(-1, -2))
+        block(page, activity, 0)
 
-        heading(page, "Steps by time", 22)
-        val steps = day?.readings(Metric.STEPS).orEmpty()
-        val chart = panel()
-        if (steps.isEmpty()) note(chart, if (day == null && readIssue == null) "Loading steps…" else "No steps recorded today", 4)
-        else block(chart, SeriesChart(this, palette, Metric.STEPS, today, band.zone, steps), 3, dp(132))
-        block(page, chart, 10)
-
-        heading(page, "Your day", 23)
-        val daily = panel()
-        daily.addView(summaryRow("Sleep", Glyph.MOON, palette.brand, day?.sleep?.let { duration(it.asleepMinutes) }) {
+        val snapshots = if (stack) column() else row().apply { gravity = Gravity.TOP }
+        val steps = snapshot("Yesterday’s steps", summary?.previousSteps?.let(::number), Glyph.STEPS, palette.steps) {
+            openHistory(Metric.STEPS, today.minusDays(1))
+        }
+        val sleep = snapshot("Last night’s sleep", day?.sleep?.let { duration(it.asleepMinutes) }, Glyph.MOON, palette.sleep) {
             openHistory(null, today)
+        }
+        if (stack) {
+            block(snapshots, steps, 0)
+            block(snapshots, sleep, 8)
+        } else {
+            snapshots.addView(steps, lp(0, -2, 1f))
+            snapshots.addView(sleep, lp(0, -2, 1f).apply { marginStart = dp(8) })
+        }
+        block(page, snapshots, 8)
+
+        sectionHeader(page, "Workouts", "View all", 17) { go(Tab.ACTIVITY) }
+        val log = workouts
+        val activeWorkout = log?.active
+        when {
+            activeWorkout != null -> workoutControl(page, 0)
+            log?.recent.isNullOrEmpty() -> {
+                val empty = panel()
+                if (log == null) note(empty, if (readIssue == null) "Loading workouts…" else "Workouts unavailable", 3)
+                else actionRow(empty, "Start workout", Glyph.WALK, !workoutBusy) { go(Tab.WORKOUT_TYPES) }
+                block(page, empty, 0)
+            }
+            else -> workoutRecords(page, log.recent)
+        }
+
+        sectionHeader(page, "7-day trends", "History", 17) {
+            openHistory(Metric.STEPS, today.minusDays(1), HistoryPeriod.WEEK)
+        }
+        val trends = panel()
+        trends.addView(summaryRow("Average daily steps", Glyph.STEPS, summary?.averageSteps?.let(::number)) {
+            openHistory(Metric.STEPS, today.minusDays(1), HistoryPeriod.WEEK)
         }, lp(-1, -2))
-        divider(daily)
-        daily.addView(summaryRow("Health monitor", Glyph.PULSE, palette.heart, null, showMissing = false) {
-            go(Tab.HEALTH)
+        divider(trends)
+        trends.addView(summaryRow("Average sleep", Glyph.MOON, summary?.averageSleep?.let { duration(it.toInt()) }) {
+            openHistory(null, today.minusDays(1), HistoryPeriod.WEEK)
         }, lp(-1, -2))
-        divider(daily)
-        val activeWorkout = workouts?.active
-        val workoutValue = activeWorkout?.type?.title ?: workouts?.recent?.count {
-            Instant.ofEpochMilli(it.start).atZone(band.zone).toLocalDate() == today
-        }?.takeIf { it > 0 }?.toString()
-        daily.addView(summaryRow("Workouts", Glyph.WALK, palette.steps, workoutValue, showMissing = false) {
-            go(Tab.ACTIVITY)
-        }, lp(-1, -2))
-        block(page, daily, 9)
+        block(page, trends, 0)
     }
 
-    private fun dailyTile(title: String, metric: Metric, value: Long?, date: LocalDate) = panel().apply {
-        setPadding(dp(14), dp(13), dp(14), dp(15))
-        background = pressable(palette.surface, palette.accent(metric), 16)
+    private fun snapshot(title: String, value: String?, glyph: Glyph, accent: Int, open: () -> Unit) = column().apply {
+        setPadding(dp(13), dp(12), dp(13), dp(13))
+        background = pressable(palette.surface, palette.ink, 15)
         isFocusable = true
-        contentDescription = "$title, ${value?.let { displayValue(metric, it) } ?: "no reading"}"
-        setOnClickListener { openHistory(metric, date) }
-        addView(Icon(this@MainActivity, metric.icon, palette.accent(metric)), lp(dp(23), dp(23)))
-        val reading = value?.let { if (metric == Metric.STEPS) number(it) else displayValue(metric, it) }
-        block(this, label(reading ?: "—", 27, palette.accent(metric), "sans-serif-medium"), 7)
-        block(this, label(title, 14, palette.ink, "sans-serif-medium"), 2)
+        contentDescription = "$title, ${value ?: "no reading"}"
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        setOnClickListener { open() }
+        val header = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        header.addView(Icon(this@MainActivity, glyph, accent), lp(dp(17), dp(17)))
+        header.addView(View(this@MainActivity), lp(0, 1, 1f))
+        header.addView(Icon(this@MainActivity, Glyph.RIGHT, palette.muted), lp(dp(14), dp(14)))
+        addView(header, lp(-1, -2))
+        block(this, label(title, 13, palette.muted, "sans-serif-medium").ignoreAccessibility(), 7)
+        block(this, label(value ?: "—", 23, palette.ink, "sans-serif-medium").apply { letterSpacing = -.025f }
+            .ignoreAccessibility(), 3)
+    }
+
+    private fun goalColor(goal: Goal) = when (goal) {
+        Goal.CALORIES -> palette.calories
+        Goal.WORKOUT -> palette.workout
+        Goal.STEPS -> palette.steps
+    }
+
+    private fun editGoals() {
+        val fields = column().apply { setPadding(dp(24), dp(4), dp(24), dp(10)) }
+        val digits = NumberFormat.getIntegerInstance().apply { isGroupingUsed = false }
+        val inputs = Goal.entries.associateWith { goal ->
+            val name = if (goal == Goal.STEPS) goal.title else "${goal.title} (${goal.unit})"
+            val field = EditText(this).apply {
+                id = View.generateViewId()
+                inputType = InputType.TYPE_CLASS_NUMBER
+                hint = name
+                setSingleLine()
+                setText(digits.format(displayPrefs.getInt(goal.name, goal.target)))
+                setSelectAllOnFocus(true)
+            }
+            fields.addView(label(name, 14, palette.muted).apply { labelFor = field.id }, lp(-1, -2).apply { topMargin = dp(10) })
+            fields.addView(field, lp(-1, -2))
+            field
+        }
+        val dialog = AlertDialog.Builder(this).setTitle("Daily goals").setView(ScrollView(this).apply { addView(fields) })
+            .setNegativeButton("Cancel", null).setPositiveButton("Save", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val values = mutableMapOf<Goal, Int>()
+                for ((goal, input) in inputs) {
+                    val value = input.text.toString().toIntOrNull()
+                    if (value == null || value !in 1..goal.max) {
+                        input.error = "Enter a number from 1 to ${number(goal.max.toLong())}."
+                        input.requestFocus()
+                        return@setOnClickListener
+                    }
+                    values[goal] = value
+                }
+                displayPrefs.edit { values.forEach { (goal, value) -> putInt(goal.name, value) } }
+                dialog.dismiss()
+                drawScreen(keepScroll = true)
+            }
+        }
+        dialog.show()
     }
 
     private fun showReadIssues(page: LinearLayout) {
@@ -475,78 +664,123 @@ class MainActivity : ComponentActivity() {
     private fun health(page: LinearLayout) {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
-        title(page, "Health monitor")
+        heading(page, "Daily averages", 15)
         showReadIssues(page)
         val day = currentDay
         val metrics = panel()
         for (metric in HEALTH_METRICS) {
             if (metrics.childCount > 0) divider(metrics)
-            val live = band.state.liveValue?.toLong()?.takeIf { band.state.measurement == metric }
-            metrics.addView(summaryRow(metric, live ?: day?.value(metric)) { openHistory(metric, today) }, lp(-1, -2))
+            metrics.addView(summaryRow(metric, day?.value(metric)) { openHistory(metric, today) }, lp(-1, -2))
         }
-        block(page, metrics, 18)
-        heading(page, "Sleep", 22)
-        block(page, sleepPanel(day?.sleep), 9)
-        addButton(page, "Sleep history", filled = false, top = 10) { openHistory(null, today) }
+        block(page, metrics, 10)
+        block(page, sleepPanel(day?.sleep, today), 14)
     }
 
     private fun activity(page: LinearLayout) {
-        val today = LocalDate.now(band.zone)
-        lastShownDate = today
-        title(page, "Activity")
+        workoutControl(page, 10)
         showReadIssues(page)
-        val day = currentDay
-        val daily = panel()
-        for (metric in ACTIVITY_METRICS) {
-            if (daily.childCount > 0) divider(daily)
-            daily.addView(summaryRow(metric, day?.value(metric)) { openHistory(metric, today) }, lp(-1, -2))
-        }
-        block(page, daily, 16)
-
-        heading(page, "Workout recorder", 24)
         val log = workouts
-        val recorder = panel()
-        val workout = log?.active
-        if (workout == null) {
-            addButton(recorder, "Start workout", enabled = !workoutBusy && log != null, top = 0) {
-                AlertDialog.Builder(this).setTitle("Workout type")
-                    .setItems(WorkoutType.entries.map { it.title }.toTypedArray()) { _, index ->
-                        val address = band.state.device?.address
-                        val start = System.currentTimeMillis()
-                        changeWorkout { app.health.startWorkout(WorkoutType.entries[index], start, address) }
-                    }.setNegativeButton("Cancel", null).show()
-            }
+        heading(page, "Recent sessions", 22)
+        if (log?.recent.isNullOrEmpty()) {
+            val empty = panel()
+            note(empty, if (log == null && readIssue == null) "Loading workouts…" else "No workouts recorded", 2)
+            block(page, empty, 9)
         } else {
-            recorder.addView(label(workout.type.title, 17, palette.ink, "sans-serif-medium"))
-            workoutTimer = label("", 36, palette.brand, "sans-serif-medium")
-            block(recorder, requireNotNull(workoutTimer), 5)
-            updateWorkoutTimer(workout)
-            if (active) app.main.postDelayed(tickWorkout, 1_000)
-            addButton(recorder, "End workout", enabled = !workoutBusy, top = 9) {
-                changeWorkout { app.health.endWorkout(workout.start, System.currentTimeMillis()) }
-            }
+            workoutRecords(page, log.recent, 9)
         }
-        block(page, recorder, 9)
+        if (workoutPage > 0 || log?.hasMore == true) {
+            val pages = row()
+            pages.addView(button("Newer", filled = false, enabled = workoutPage > 0) {
+                changeWorkoutPage(-1)
+            }, lp(0, -2, 1f))
+            pages.addView(button("Older", filled = false, enabled = log?.hasMore == true) {
+                changeWorkoutPage(1)
+            }, lp(0, -2, 1f).apply { marginStart = dp(8) })
+            block(page, pages, 10)
+        }
+    }
 
-        heading(page, "Workout history", 24)
+    private fun workoutRecords(page: LinearLayout, workouts: List<Workout>, top: Int = 0) {
         val records = panel()
-        for (record in log?.recent.orEmpty()) {
+        for (record in workouts) {
             if (records.childCount > 0) divider(records)
-            val line = row().apply { setPadding(0, dp(9), 0, dp(9)); minimumHeight = dp(52) }
+            val line = row().apply { setPadding(0, dp(8), 0, dp(8)); minimumHeight = dp(54) }
+            line.addView(iconBadge(Glyph.WALK, palette.workout), lp(dp(34), dp(34)))
             val identity = column()
-            identity.addView(label(record.type.title, 16, palette.ink, "sans-serif-medium"))
-            note(identity, dateTime(record.start, band.zone), 3)
-            record.averageHeartRate?.let { note(identity, "Average heart rate · ${displayValue(Metric.HEART, it.toLong())}", 3) }
-            line.addView(identity, lp(0, -2, 1f))
-            line.addView(label(workoutDuration(record), 15, palette.ink), lp(-2, -2).apply { marginStart = dp(8) })
+            identity.addView(label(record.type.title, 15, palette.ink, "sans-serif-medium"))
+            val date = Instant.ofEpochMilli(record.start).atZone(band.zone).toLocalDate()
+            val heart = record.averageHeartRate?.let { " · $it bpm avg" }.orEmpty()
+            note(identity, date.format(MONTH_DAY) + heart, 3)
+            line.addView(identity, lp(0, -2, 1f).apply { marginStart = dp(10) })
+            line.addView(label(sessionDuration(record), 15, palette.workout, "sans-serif-medium"),
+                lp(-2, -2).apply { marginStart = dp(8) })
             records.addView(line, lp(-1, -2))
         }
-        if (records.childCount == 0) note(records, if (log == null && readIssue == null) "Loading workouts…" else "No workouts recorded", 2)
-        block(page, records, 9)
-        if (log?.hasMore == true) addButton(page, "Show more workouts", filled = false, top = 9) {
-            workoutLimit += 30
-            loadData()
+        block(page, records, top)
+    }
+
+    private fun workoutTypes(page: LinearLayout) {
+        val groups = listOf(
+            "Cardio" to listOf(WorkoutType.WALK, WorkoutType.RUN, WorkoutType.CYCLE, WorkoutType.HIKE, WorkoutType.HIIT),
+            "Strength and mobility" to listOf(WorkoutType.STRENGTH, WorkoutType.YOGA),
+            "Other" to listOf(WorkoutType.OTHER)
+        )
+        groups.forEach { (name, types) ->
+            if (types.size > 1) heading(page, name, 16)
+            val choices = panel()
+            for (type in types) actionRow(choices, type.title, Glyph.WALK, !workoutBusy) {
+                val address = band.state.device?.address
+                val start = System.currentTimeMillis()
+                workoutPage = 0
+                changeWorkout { app.health.startWorkout(type, start, address) }
+                go(backDestination())
+            }
+            block(page, choices, if (types.size > 1) 7 else 13)
         }
+    }
+
+    private fun changeWorkoutPage(offset: Int) {
+        workoutPage += offset
+        workouts = workouts?.copy(recent = emptyList(), hasMore = false)
+        drawScreen(keepScroll = true)
+        loadData()
+    }
+
+    private fun workoutControl(page: LinearLayout, top: Int) {
+        val log = workouts
+        val workout = log?.active
+        if (workout == null) {
+            addButton(page, "Start workout", enabled = !workoutBusy && log != null, top = top) {
+                go(Tab.WORKOUT_TYPES)
+            }
+            return
+        }
+        val paused = workout.pausedAt != null
+        val recorder = panel()
+        val header = row()
+        header.addView(iconBadge(Glyph.WALK, palette.workout), lp(dp(34), dp(34)))
+        header.addView(label(workout.type.title, 17, palette.ink, "sans-serif-medium"),
+            lp(0, -2, 1f).apply { marginStart = dp(10) })
+        header.addView(label(if (paused) "Paused" else "In progress", 13, palette.workout))
+        block(recorder, header, 0)
+        workoutTimer = readout("", size = 38)
+        block(recorder, requireNotNull(workoutTimer), 8)
+        updateWorkoutTimer(workout)
+        if (active && !paused) app.main.postDelayed(tickWorkout, 1_000)
+        val controls = row()
+        controls.addView(button(if (paused) "Resume" else "Pause", filled = true, enabled = !workoutBusy) {
+            val now = System.currentTimeMillis()
+            changeWorkout {
+                if (paused) app.health.resumeWorkout(workout.start, now) else app.health.pauseWorkout(workout.start, now)
+            }
+        }, lp(0, -2, 1f))
+        controls.addView(button("End workout", filled = false, enabled = !workoutBusy) {
+            workoutPage = 0
+            val now = System.currentTimeMillis()
+            changeWorkout { app.health.endWorkout(workout.start, now) }
+        }, lp(0, -2, 1f).apply { marginStart = dp(8) })
+        block(recorder, controls, 10)
+        block(page, recorder, top)
     }
 
     private fun changeWorkout(change: () -> Unit) {
@@ -571,46 +805,106 @@ class MainActivity : ComponentActivity() {
         return String.format(java.util.Locale.getDefault(), "%02d:%02d:%02d", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
     }
 
-    private fun openHistory(metric: Metric?, day: LocalDate) {
+    private fun openHistory(metric: Metric?, day: LocalDate, period: HistoryPeriod = HistoryPeriod.DAY) {
         historyMetric = metric
-        historyWeek = false
-        historyDate = day
-        shownRecords = 24
-        go(Tab.HISTORY)
+        historyPeriod = period
+        if (tab == Tab.HISTORY) selectDate(day)
+        else {
+            historyDate = day
+            go(Tab.HISTORY)
+        }
+    }
+
+    private fun sessionDuration(workout: Workout): String {
+        val seconds = workout.seconds(0)
+        return if (seconds < 60) "${number(seconds)} sec" else duration((seconds / 60).toInt())
     }
 
     private fun summaryRow(metric: Metric, value: Long?, action: () -> Unit) =
-        summaryRow(metric.title, metric.icon, palette.accent(metric), value?.let { displayValue(metric, it) }, action = action)
+        summaryRow(metric.title, metric.icon, value?.let { displayValue(metric, it) }, action = action)
 
-    private fun summaryRow(title: String, icon: Glyph, accent: Int, value: String?, showMissing: Boolean = true, action: () -> Unit) = row().apply {
+    private fun summaryRow(title: String, icon: Glyph, value: String?, showMissing: Boolean = true, action: () -> Unit) = row().apply {
         minimumHeight = dp(55)
         setPadding(0, dp(7), 0, dp(7))
         background = pressable(Color.TRANSPARENT, palette.ink, 11)
         isFocusable = true
         contentDescription = if (value != null || showMissing) "$title, ${value ?: "no reading"}" else title
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         setOnClickListener { action() }
-        addView(Icon(this@MainActivity, icon, accent), lp(dp(23), dp(23)))
-        addView(label(title, 16, palette.ink, "sans-serif-medium"), lp(0, -2, 1f).apply { marginStart = dp(12) })
-        if (value != null || showMissing) addView(label(value ?: "—", 15, palette.muted),
-            lp(-2, -2).apply { marginStart = dp(8) })
+        addView(Icon(this@MainActivity, icon, palette.ink), lp(dp(22), dp(22)))
+        addView(label(title, 16, palette.ink, "sans-serif-medium")
+            .apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }, lp(0, -2, 1f).apply { marginStart = dp(12) })
+        if (value != null || showMissing) {
+            val reading = label(value ?: "—", 15, palette.muted).apply {
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }
+            addView(reading, lp(-2, -2).apply { marginStart = dp(8) })
+        }
         addView(Icon(this@MainActivity, Glyph.RIGHT, palette.muted), lp(dp(15), dp(15)).apply { marginStart = dp(8) })
     }
 
     private fun history(page: LinearLayout) {
-        title(page, "History")
         val zone = band.zone
-        val day = currentDay
         val today = LocalDate.now(zone)
-        val hasEarlier = if (historyWeek) week.firstOrNull()?.second?.earlier == true else day?.earlier == true
-        val dateStep = if (historyWeek) 7L else 1L
-        val dateRow = row().apply { background = shape(palette.surface, 15, palette.border); setPadding(dp(5), 0, dp(5), 0) }
-        dateRow.addView(iconButton(Glyph.LEFT, "Previous period", hasEarlier) {
-            selectDate(historyDate.minusDays(dateStep))
-        }, lp(dp(48), dp(52)))
-        val dateText = if (historyWeek) {
-            "${historyDate.minusDays(6).format(MONTH_DAY)} – ${historyDate.format(MONTH_DAY)}"
-        } else historyDate.format(SHORT_DATE)
-        val date = label(dateText, 15, palette.ink, "sans-serif-medium").apply {
+        val period = historyPeriod
+        val end = period.endDate(historyDate, today)
+        val dates = period.dates(end)
+        val metric = historyMetric
+        val metricName = metric?.title ?: "Sleep"
+        val picker = row().apply {
+            minimumHeight = dp(60)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = pressable(palette.surface, palette.ink, 20)
+            contentDescription = "$metricName, choose metric"
+            isFocusable = true
+            addView(Icon(this@MainActivity, metric?.icon ?: Glyph.MOON, palette.ink), lp(dp(22), dp(22)))
+            addView(label(metricName, 18, palette.ink, "sans-serif-medium"),
+                lp(0, -2, 1f).apply { marginStart = dp(11) })
+            addView(Icon(this@MainActivity, Glyph.DOWN, palette.ink), lp(dp(19), dp(19)))
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity).setTitle("Metric")
+                    .setSingleChoiceItems((Metric.entries.map { it.title } + "Sleep").toTypedArray(),
+                        metric?.ordinal ?: Metric.entries.size) { dialog, which ->
+                        historyMetric = Metric.entries.getOrNull(which)
+                        dialog.dismiss()
+                        selectDate(historyDate)
+                    }.setNegativeButton("Cancel", null).show()
+            }
+        }
+        block(page, picker, 12)
+        val periods = row().apply {
+            background = shape(palette.tint, 19)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        for (choice in HistoryPeriod.entries) {
+            val control = button(choice.title, filled = false) {
+                if (historyPeriod != choice) {
+                    historyPeriod = choice
+                    selectDate(historyDate)
+                }
+            }.apply {
+                isSelected = period == choice
+                background = pressable(if (isSelected) palette.surface else Color.TRANSPARENT, palette.ink, 15)
+            }
+            periods.addView(control, lp(0, -2, 1f))
+        }
+        block(page, periods, 10)
+
+        val dateRow = row()
+        val earlier = currentDay?.earlier ?: trend?.earlier ?: false
+        dateRow.addView(iconButton(Glyph.LEFT, "Previous period", earlier) {
+            selectDate(dates.first().minusDays(1))
+        }, lp(dp(48), dp(48)))
+        val dateText = when (period) {
+            HistoryPeriod.DAY -> end.format(SHORT_DATE)
+            HistoryPeriod.WEEK -> {
+                val start = dates.first()
+                val startFormat = if (start.year == end.year) MONTH_DAY else SHORT_DATE
+                "${start.format(startFormat)} – ${end.format(SHORT_DATE)}"
+            }
+            HistoryPeriod.YEAR -> "${dates.first().format(MONTH_YEAR)} – ${end.format(MONTH_YEAR)}"
+        }
+        val date = label(dateText, 14, palette.ink, "sans-serif-medium").apply {
             gravity = Gravity.CENTER
             minHeight = dp(48)
             contentDescription = "Choose date, $dateText"
@@ -626,142 +920,110 @@ class MainActivity : ComponentActivity() {
             }
         }
         dateRow.addView(date, lp(0, -2, 1f))
-        dateRow.addView(iconButton(Glyph.RIGHT, "Next period", historyDate < today) {
-            selectDate(historyDate.plusDays(dateStep))
-        }, lp(dp(48), dp(52)))
-        block(page, dateRow, 18)
-        val periods = row()
-        listOf(false to "Day", true to "7 days").forEach { (isWeek, name) ->
-            periods.addView(button(name, filled = historyWeek == isWeek) {
-                if (historyWeek != isWeek) {
-                    historyWeek = isWeek
-                    selectDate(historyDate)
-                }
-            }.apply { isSelected = historyWeek == isWeek }, lp(0, -2, 1f).apply {
-                if (isWeek) marginStart = dp(8)
-            })
-        }
-        block(page, periods, 8)
+        dateRow.addView(iconButton(Glyph.RIGHT, "Next period", end < today) {
+            selectDate(period.next(end))
+        }, lp(dp(48), dp(48)))
+        block(page, dateRow, 5)
+        showReadIssues(page)
 
-        val metric = historyMetric
-        val metricName = metric?.title ?: "Sleep"
-        val picker = row().apply {
-            minimumHeight = dp(52)
-            setPadding(dp(15), dp(6), dp(15), dp(6))
-            background = pressable(palette.surface, palette.brand, 15)
-            contentDescription = "$metricName, choose metric"
-            isFocusable = true
-            addView(Icon(this@MainActivity, metric?.icon ?: Glyph.MOON, metric?.let(palette::accent) ?: palette.brand),
-                lp(dp(21), dp(21)))
-            addView(label(metricName, 16, palette.ink, "sans-serif-medium"), lp(0, -2, 1f).apply { marginStart = dp(11) })
-            addView(Icon(this@MainActivity, Glyph.DOWN, palette.brand), lp(dp(19), dp(19)))
-            setOnClickListener {
-                AlertDialog.Builder(this@MainActivity).setTitle("Health metric")
-                    .setSingleChoiceItems((Metric.entries.map { it.title } + "Sleep").toTypedArray(),
-                        metric?.ordinal ?: Metric.entries.size) { dialog, which ->
-                        historyMetric = Metric.entries.getOrNull(which)
-                        shownRecords = 24
-                        dialog.dismiss()
-                        drawScreen(keepScroll = true)
-                    }.setNegativeButton("Cancel", null).show()
-            }
-        }
-        block(page, picker, 10)
-        readIssue?.let { note(page, it, 12, true) }
-
-        if (historyWeek) {
-            weeklyHistory(page, metric)
+        if (period != HistoryPeriod.DAY) {
+            trendPanel(page, metric, period, dates)
             return
         }
+        val day = currentDay
         if (metric == null) {
-            block(page, sleepPanel(day?.sleep), 16)
+            block(page, sleepPanel(day?.sleep), 8)
             return
         }
-        val values = day?.readings(metric).orEmpty()
-        val state = band.state
-        val currentMeasurement = state.measurement == metric && historyDate == today
-        val live = state.liveValue?.takeIf { currentMeasurement }?.toLong()
-        val detail = metricPanel(metric, values, historyDate, zone, live ?: day?.value(metric), live != null)
-        if (metric == Metric.HEART) day?.averageHeartRate()?.let {
-            note(detail, "Average heart rate · ${displayValue(metric, it)}", 7)
+        val detail = panel()
+        val value = day?.value(metric)
+        val spot = day?.spot
+        if (value == null && spot == null) {
+            note(detail, if (day == null && readIssue == null) "Loading readings…" else "No readings for this day", 4)
         }
-        if (historyDate == today && metric.liveType != null) {
-            val measuring = currentMeasurement && state.action == BandAction.MEASURING
-            if (state.connection == Connection.CONNECTED) {
-                addButton(detail, if (measuring) "Stop measurement" else "Measure",
-                    enabled = measuring || state.action == BandAction.IDLE, top = 12) {
-                    if (measuring) band.stopMeasurement() else band.measure(metric)
-                }
-                if (measuring && state.liveValue == null) note(detail, "Keep your wrist still.", 8)
-                if (currentMeasurement) state.measurementMessage?.let { note(detail, it, 8, true) }
-            } else {
-                addButton(detail, "Connect band", filled = false, top = 12) { go(Tab.BAND) }
-            }
+        if (value != null) {
+            detail.addView(readout(number(value), metric.unit))
+            note(detail, if (metric.isTotal) "Daily total" else "Daily average", 3)
+            plot(detail, dayPoints(day.buckets(metric)), metric,
+                if (metric.isTotal) "3-hour totals" else "3-hour averages", 16, caption = true)
         }
-        block(page, detail, 16)
-        if (values.isEmpty()) return
-
-        heading(page, "Readings", 23)
-        val records = panel()
-        for (record in values.asReversed().take(shownRecords)) {
-            if (records.childCount > 0) divider(records)
-            val line = row().apply { minimumHeight = dp(46) }
-            val timestamp = TIME.format(Instant.ofEpochMilli(record.time).atZone(zone))
-            val detail = if (record.origin == Origin.LIVE) "$timestamp · Spot check" else timestamp
-            line.addView(label(detail, 14, palette.muted), lp(0, -2, 1f))
-            line.addView(label(displayValue(record.metric, record.value.toLong()), 15, palette.ink, "sans-serif-medium"))
-            records.addView(line, lp(-1, -2))
+        if (spot != null) {
+            note(detail, "Latest spot check · ${displayValue(metric, spot)}", if (value == null) 4 else 14)
         }
-        block(page, records, 10)
-        if (shownRecords < values.size) addButton(page, "Show more readings", filled = false, top = 12) {
-            shownRecords += 24
-            drawScreen(keepScroll = true)
-        }
+        block(page, detail, 8)
     }
 
-    private fun weeklyHistory(page: LinearLayout, metric: Metric?) {
-        val values = week.map { (_, day) ->
-            when (metric) {
-                null -> day.sleep?.asleepMinutes?.toLong()
-                Metric.HEART -> day.averageHeartRate()
-                else -> day.value(metric)
-            }
-        }
-        val plot = panel()
-        if (values.none { it != null }) {
-            note(plot, if (week.isEmpty() && readIssue == null) "Loading readings…" else "No readings for this period", 4)
+    private fun trendPanel(page: LinearLayout, metric: Metric?, period: HistoryPeriod, dates: List<LocalDate>) {
+        val panel = panel()
+        val series = trend?.buckets
+        val total = metric?.isTotal == true
+        val value = series?.combined()?.value(total)
+        if (value == null) {
+            note(panel, if (series == null && readIssue == null) "Loading readings…" else "No readings for this period", 4)
         } else {
-            if (metric == Metric.HEART) section(plot, Glyph.PULSE, "Daily average heart rate", palette.heart)
-            block(plot, WeekChart(this, palette, metric?.let(palette::accent) ?: palette.brand,
-                week.map { it.first.format(WEEKDAY) }, values, metric == null || metric.isTotal), 5, dp(150))
-            for ((index, entry) in week.withIndex().reversed()) {
-                divider(plot)
-                val value = values[index]?.let {
-                    if (metric == null) duration(it.toInt()) else displayValue(metric, it)
+            panel.addView(if (metric == null) readout(duration(value.toInt())) else readout(number(value), metric.unit))
+            note(panel, if (total) "Period total" else "Period average", 3)
+            val byMonth = period == HistoryPeriod.YEAR
+            val points = dates.mapIndexed { index, date ->
+                val axis = when {
+                    !byMonth -> number(date.dayOfMonth.toLong())
+                    index % 3 == 0 || index == dates.lastIndex -> date.format(MONTH)
+                    else -> ""
                 }
-                plot.addView(summaryRow(entry.first.format(SHORT_DATE), Glyph.CALENDAR, palette.muted, value) {
-                    historyWeek = false
-                    selectDate(entry.first)
-                }, lp(-1, -2))
+                ChartPoint(axis, date.format(if (byMonth) MONTH_YEAR else SHORT_DATE), series[index].value(total))
             }
+            val caption = (if (byMonth) "Monthly " else "Daily ") + if (total) "totals" else "averages"
+            if (byMonth) plot(panel, points, metric, caption, 16, caption = true)
+            else plot(panel, points, metric, caption, 16, caption = true) { openHistory(metric, dates[it]) }
         }
-        block(page, plot, 13)
+        block(page, panel, 8)
     }
 
-    private fun sleepPanel(night: SleepNight?) = panel().apply {
-        if (night == null) {
-            note(this, if (currentDay == null && readIssue == null) "Loading readings…" else "No sleep recorded", 3)
-            val state = band.state
-            if (state.detailSyncAvailable && !state.detailSyncEnabled) {
-                addButton(this, "Set up sleep sync", enabled = state.action == BandAction.IDLE, top = 12) {
-                    detailsDialog(false)
-                }
+    private fun dayPoints(values: List<Long?>) = values.mapIndexed { index, value ->
+        val hour = index * DAY_BUCKET_HOURS
+        val from = LocalTime.of(hour, 0)
+        val until = from.plusHours(DAY_BUCKET_HOURS.toLong())
+        ChartPoint(if (index % 2 == 0) from.format(CHART_HOUR) else "", "${TIME.format(from)} to ${TIME.format(until)}", value)
+    }
+
+    private fun plot(parent: LinearLayout, points: List<ChartPoint>, metric: Metric?, title: String, top: Int,
+                     caption: Boolean = false, openPoint: ((Int) -> Unit)? = null) {
+        fun description(point: ChartPoint): String {
+            val value = point.value?.let { if (metric == null) duration(it.toInt()) else displayValue(metric, it) }
+            return "${point.label}, ${value ?: "no reading"}"
+        }
+        if (caption) note(parent, title, top)
+        val description = if (openPoint == null) "$title. " + points.joinToString(". ", transform = ::description) else null
+        val chart = BarChart(this, palette, points, description, durationAxis = metric == null)
+        val frame = FrameLayout(this)
+        frame.addView(chart, FrameLayout.LayoutParams(-1, -1))
+        if (openPoint != null) {
+            val hitTargets = row()
+            points.forEachIndexed { index, point ->
+                hitTargets.addView(View(this).apply {
+                    contentDescription = description(point)
+                    isFocusable = true
+                    background = pressable(Color.TRANSPARENT, palette.ink, 8)
+                    setOnClickListener { openPoint(index) }
+                }, lp(0, -1, 1f))
             }
+            frame.addView(hitTargets, FrameLayout.LayoutParams(-1, -1).apply { rightMargin = chart.axisWidth() })
+        }
+        val height = 130 + (resources.configuration.fontScale.coerceAtLeast(1f) * 14).toInt()
+        block(parent, frame, if (caption) 8 else top, dp(height))
+    }
+
+    private fun sleepPanel(night: SleepNight?, historyLink: LocalDate? = null) = panel().apply {
+        if (historyLink != null) {
+            addView(summaryRow("Sleep", Glyph.MOON, null, showMissing = false) {
+                openHistory(null, historyLink)
+            }, lp(-1, -2))
+        }
+        if (night == null) {
+            note(this, if (currentDay == null && readIssue == null) "Loading sleep…" else "No sleep recorded", 4)
             return@apply
         }
-        addView(label(duration(night.asleepMinutes), 43, palette.brand, "sans-serif-medium").apply {
-            letterSpacing = -.035f
-        }, lp(-1, -2))
+        addView(readout(duration(night.asleepMinutes)), lp(-1, -2))
         val start = LocalTime.ofSecondOfDay(night.startMinute * 60L)
         note(this, "Sleep began at ${TIME.format(start)}", 5)
         block(this, SleepTimeline(this@MainActivity, palette, night.segments), 18, dp(20))
@@ -778,33 +1040,10 @@ class MainActivity : ComponentActivity() {
 
     private fun selectDate(day: LocalDate) {
         historyDate = day.coerceAtMost(LocalDate.now(band.zone))
-        shownRecords = 24
         currentDay = null
-        week = emptyList()
+        trend = null
         drawScreen()
         loadData()
-    }
-
-    private fun connectionStrip(state: BandState): View {
-        val device = state.connecting ?: state.device
-        val line = row().apply {
-            minimumHeight = dp(76)
-            setPadding(dp(14), dp(12), dp(15), dp(12))
-            background = pressable(palette.tint, palette.brand, 17)
-            isFocusable = true
-            setOnClickListener { go(Tab.BAND) }
-        }
-        line.addView(Icon(this, Glyph.BAND, palette.brand), lp(dp(32), dp(32)))
-        val words = column()
-        words.addView(label(device?.name ?: "Connect a band", 17, palette.ink, "sans-serif-medium"))
-        if (device != null) words.addView(label(connectionText(state), 13, palette.muted),
-            lp(-1, -2).apply { topMargin = dp(3) })
-        line.addView(words, lp(0, -2, 1f).apply { marginStart = dp(12) })
-        val battery = state.battery
-        if (battery != null) line.addView(label("$battery%", 17, palette.brand, "sans-serif-medium")
-            .apply { contentDescription = "$battery percent battery" })
-        line.addView(Icon(this, Glyph.RIGHT, palette.brand), lp(dp(16), dp(16)).apply { marginStart = dp(7) })
-        return line
     }
 
     private fun bandPage(page: LinearLayout) {
@@ -812,17 +1051,12 @@ class MainActivity : ComponentActivity() {
         val current = state.connecting ?: state.device
         val connected = state.connection == Connection.CONNECTED
         val idle = state.action == BandAction.IDLE
-        title(page, "Band")
-
-        val devicePanel = panel().apply {
-            background = shape(palette.tint, 18)
-            setPadding(dp(17), dp(17), dp(17), dp(17))
-        }
+        val devicePanel = panel()
         val identity = row()
         identity.addView(Icon(this, Glyph.BAND, palette.brand), lp(dp(48), dp(48)))
         val words = column()
-        words.addView(label(current?.name ?: "Connect your band", 23, palette.ink, "sans-serif-medium"))
-        note(words, if (current == null) "Keep your HK50 or H59 nearby." else connectionText(state), 4)
+        words.addView(label(current?.name ?: "Connect a band", 23, palette.ink, "sans-serif-medium"))
+        if (current != null) note(words, connectionText(state), 4)
         identity.addView(words, lp(0, -2, 1f).apply { marginStart = dp(13) })
         devicePanel.addView(identity, lp(-1, -2))
         state.battery?.let {
@@ -859,16 +1093,23 @@ class MainActivity : ComponentActivity() {
             Connection.CONNECTING -> addButton(devicePanel, "Cancel", filled = false, top = 16) { band.disconnect() }
             Connection.CONNECTED -> addButton(devicePanel, "Sync now", enabled = idle, top = 16) { band.importHistory(false) }
         }
-        block(page, devicePanel, 20)
+        block(page, devicePanel, 10)
+        app.storageIssue?.let { note(page, it, 12, true) }
 
-        heading(page, "Band tools", 24)
+        heading(page, "Tools", 24)
         val tools = panel()
-        actionRow(tools, "Find band", Glyph.SCAN, connected && idle) { band.findBand() }
-        actionRow(tools, "Wrist shutter", Glyph.CAMERA, true, action = ::openCamera)
-        actionRow(tools, if (app.callAlertsRunning) "Turn off call alerts" else "Turn on call alerts",
-            Glyph.PHONE, app.callAlertsRunning || state.device != null) { toggleCallAlerts() }
-        if (connected) actionRow(tools, "Test call alert", Glyph.PHONE, idle) { band.testCallAlert() }
-        app.callAlertsIssue?.let { note(tools, it, 7, true) }
+        actionRow(tools, "Phone clock", Glyph.CLOCK, true) { go(Tab.CLOCK) }
+        if (phoneCameraAvailable()) actionRow(tools, "Camera remote", Glyph.CAMERA, true, action = ::openCamera)
+        if (connected) {
+            actionRow(tools, "Find band", Glyph.SCAN, idle) { band.findBand() }
+            spotCheck(tools, state)
+        }
+        if (state.device != null || app.callAlertsRunning) {
+            actionRow(tools, if (app.callAlertsRunning) "Turn off call alerts" else "Turn on call alerts",
+                Glyph.PHONE, true) { toggleCallAlerts() }
+            if (connected) actionRow(tools, "Test call alert", Glyph.PHONE, idle) { band.testCallAlert() }
+            app.callAlertsIssue?.let { note(tools, it, 7, true) }
+        }
         block(page, tools, 9)
 
         if (connected) {
@@ -924,6 +1165,28 @@ class MainActivity : ComponentActivity() {
         block(page, data, 9)
     }
 
+    private fun spotCheck(tools: LinearLayout, state: BandState) {
+        val measuring = state.action == BandAction.MEASURING
+        actionRow(tools, if (measuring) "Stop measurement" else "Spot check", Glyph.PULSE,
+            measuring || state.action == BandAction.IDLE) {
+            if (measuring) band.stopMeasurement() else {
+                val metrics = HEALTH_METRICS.filter { it.liveType != null }
+                AlertDialog.Builder(this).setTitle("Spot check")
+                    .setItems(metrics.map { it.title }.toTypedArray()) { _, index -> band.measure(metrics[index]) }
+                    .setNegativeButton("Cancel", null).show()
+            }
+        }
+        val metric = state.measurement ?: return
+        val value = state.liveValue?.toLong()
+        if (measuring) note(tools, value?.let { "${metric.title} · ${displayValue(metric, it)}" } ?: "Keep your wrist still.", 3)
+        else if (value != null && state.measurementAt != null) {
+            val date = state.measurementAt.atZone(band.zone).toLocalDate()
+            divider(tools)
+            tools.addView(summaryRow(metric, value) { openHistory(metric, date) }, lp(-1, -2))
+        }
+        state.measurementMessage?.let { note(tools, it, 3, true) }
+    }
+
     private fun toggleCallAlerts() {
         val service = Intent(this, CallRelayService::class.java)
         if (app.callAlertsRunning) {
@@ -958,9 +1221,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun phoneCameraAvailable() = packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+
     private fun openCamera() {
+        if (!phoneCameraAvailable()) return
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) go(Tab.CAMERA)
-        else cameraPermission.launch(Manifest.permission.CAMERA)
+        else {
+            cameraPermissionPending = true
+            cameraPermission.launch(Manifest.permission.CAMERA)
+        }
     }
 
     private fun permissionSettings(title: String, message: String) {
@@ -971,26 +1240,77 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun cameraScreen() {
-        val screen = column().apply { setPadding(dp(20), dp(13), dp(20), dp(12)) }
-        val bar = row()
-        bar.addView(iconButton(Glyph.LEFT, "Back to band", true) { go(Tab.BAND) }, lp(dp(48), dp(48)))
-        bar.addView(label("Wrist shutter", 24, palette.ink, "sans-serif-medium"), lp(0, -2, 1f))
-        block(screen, bar, 0)
+        val screen = column().apply { setPadding(dp(18), dp(10), dp(18), dp(12)) }
+        pageHeader(screen)
         val preview = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             background = shape(Color.BLACK, 15)
             clipToOutline = true
         }
-        screen.addView(preview, lp(-1, 0, 1f).apply { topMargin = dp(8) })
         val status = label("", 14, palette.muted).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
         val take = button("Take photo", filled = true) {}
-        val retry = button("Retry wrist shutter", filled = false) {}
-        block(screen, status, 10)
-        block(screen, retry, 4)
-        block(screen, take, 8)
+        val retry = button("Retry band shutter", filled = false) {}
+        val settings = row()
+        val timer = button("Timer off", filled = false) {}
+        val lens = button("Switch camera", filled = false) {}
+        settings.addView(timer, lp(0, -2, 1f))
+        settings.addView(lens, lp(0, -2, 1f).apply { marginStart = dp(8) })
+        val controls = if (expanded) column() else screen
+        if (expanded) {
+            val body = row().apply { gravity = Gravity.CENTER_VERTICAL }
+            body.addView(preview, lp(0, -1, 1f))
+            body.addView(ScrollView(this).apply { addView(controls) }, lp(dp(290), -2).apply { marginStart = dp(16) })
+            screen.addView(body, lp(-1, 0, 1f).apply { topMargin = dp(8) })
+        } else {
+            screen.addView(preview, lp(-1, 0, 1f).apply { topMargin = dp(8) })
+        }
+        block(controls, status, 10)
+        block(controls, retry, 4)
+        block(controls, settings, 8)
+        block(controls, take, 8)
         content.removeAllViews()
         content.addView(screen, FrameLayout.LayoutParams(-1, -1))
-        camera = BandCamera(this, band, preview, status, take, retry).also { it.resume(resumed) }
+        camera = BandCamera(this, band, preview, status, take, retry, timer, lens).also { it.resume(resumed) }
+    }
+
+    private fun clockScreen() {
+        val digital = displayPrefs.getBoolean("digitalClock", true)
+        val screen = column().apply { setPadding(dp(18), dp(10), dp(18), dp(20)) }
+        pageHeader(screen)
+        val face = panel().apply { gravity = Gravity.CENTER_HORIZONTAL; setPadding(dp(12), dp(26), dp(12), dp(26)) }
+        val time = TextClock(this).apply {
+            format12Hour = "h:mm a"
+            format24Hour = "HH:mm"
+            textSize = if (digital) 56f else 20f
+            if (digital) setAutoSizeTextTypeUniformWithConfiguration(20, 56, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            fontFeatureSettings = "'tnum'"
+            letterSpacing = -.035f
+            gravity = Gravity.CENTER
+            setTextColor(palette.brand)
+        }
+        if (!digital) face.addView(AnalogFace(this, palette), lp(dp(200), dp(200)))
+        block(face, time, if (digital) 0 else 12)
+        face.addView(TextClock(this).apply {
+            format12Hour = "EEE, MMM d"
+            format24Hour = format12Hour
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(palette.muted)
+        }, lp(-1, -2))
+        block(screen, face, 12)
+        val styles = row()
+        for ((name, choice) in listOf("Digital" to true, "Analog" to false)) {
+            val selected = digital == choice
+            styles.addView(button(name, filled = selected) {
+                displayPrefs.edit { putBoolean("digitalClock", choice) }
+                clockScreen()
+            }.apply { isSelected = selected }, lp(0, -2, 1f).apply { if (!choice) marginStart = dp(8) })
+        }
+        block(screen, styles, 9)
+        scroll = ScrollView(this).apply { addView(screen); isFillViewport = true }
+        content.removeAllViews()
+        content.addView(scroll, FrameLayout.LayoutParams(-1, -1))
     }
 
     private fun detailsDialog(configured: Boolean) {
@@ -1041,7 +1361,6 @@ class MainActivity : ComponentActivity() {
 
     private fun backupPage(page: LinearLayout) {
         val backup = app.settings.state()
-        title(page, "Backup")
         val status = panel()
         section(status, Glyph.BACKUP, "Home server", palette.brand)
         if (backup.endpoint == null) {
@@ -1173,48 +1492,62 @@ class MainActivity : ComponentActivity() {
             BandAction.IMPORTING -> "Syncing…"
             BandAction.MEASURING -> "Measuring…"
             BandAction.SETTING -> "Updating band…"
-            BandAction.CAMERA -> "Wrist shutter"
+            BandAction.CAMERA -> "Camera shutter active"
             BandAction.IDLE -> "Connected"
         }
     }
 
-    private fun metricPanel(metric: Metric, readings: List<Reading>, date: LocalDate, zone: ZoneId,
-                            value: Long?, live: Boolean): LinearLayout {
-        return panel().apply {
-            val accent = palette.accent(metric)
-            if (value == null) {
-                note(this, if (currentDay == null && readIssue == null) "Loading readings…" else "No readings for this day", 3)
-            } else {
-                val numberRow = row().apply {
-                    gravity = Gravity.BOTTOM
-                    addView(label(number(value), 43, accent, "sans-serif-medium").apply { letterSpacing = -.035f })
-                    if (metric.unit.isNotEmpty()) {
-                        addView(label(metric.unit, 15, palette.muted), lp(-2, -2).apply {
-                            marginStart = dp(6)
-                            bottomMargin = dp(6)
-                        })
-                    }
-                }
-                addView(numberRow, lp(-1, -2))
-                if (live) {
-                    note(this, "Live reading", 4)
-                } else if (!metric.isTotal && readings.isNotEmpty()) {
-                    note(this, "Latest · ${TIME.format(Instant.ofEpochMilli(readings.last().time).atZone(zone))}", 4)
-                }
-            }
-            if (readings.isNotEmpty()) {
-                block(this, SeriesChart(this@MainActivity, palette, metric, date, zone, readings), 11, dp(142))
+    private fun readout(value: String, unit: String = "", size: Int = 43): TextView {
+        val text = if (unit.isEmpty()) value else if (unit == "%") "$value%" else "$value $unit"
+        return label(text, size, palette.ink, "sans-serif-medium").apply {
+            letterSpacing = -.038f
+            if (unit.isNotEmpty()) {
+                val styled = android.text.SpannableString(text)
+                styled.setSpan(android.text.style.RelativeSizeSpan(.44f), value.length, text.length, 0)
+                styled.setSpan(android.text.style.ForegroundColorSpan(palette.muted), value.length, text.length, 0)
+                this.text = styled
             }
         }
     }
 
-    private fun title(page: LinearLayout, text: String, detail: String? = null) {
-        page.addView(label(text, 44, palette.ink, "sans-serif-black").apply {
-            letterSpacing = -.038f
-            if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
-        })
-        detail?.let { note(page, it, 4) }
+    private fun screenTitle(text: String) = label(text, 36, palette.ink, "sans-serif-medium").apply {
+        letterSpacing = -.035f
+        if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
     }
+
+    private fun pageHeader(page: LinearLayout) {
+        if (tab.inNavigation) {
+            block(page, screenTitle(tab.title), 0)
+            return
+        }
+        val bar = row()
+        val parent = backDestination()
+        bar.addView(iconButton(Glyph.LEFT, "Back to ${parent.title}", true) { go(parent) }, lp(dp(48), dp(48)))
+        bar.addView(label(tab.title, 24, palette.ink, "sans-serif-medium").apply {
+            if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+        }, lp(0, -2, 1f))
+        block(page, bar, 0)
+    }
+
+    private fun sectionHeader(page: LinearLayout, title: String, action: String, top: Int, open: () -> Unit) {
+        val header = row()
+        header.addView(label(title, 22, palette.ink, "sans-serif-medium").apply {
+            letterSpacing = -.025f
+            if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+        }, lp(0, -2, 1f))
+        header.addView(button(action, filled = false, action = open).apply {
+            background = pressable(Color.TRANSPARENT, palette.brand, 12)
+            setPadding(dp(11), dp(6), 0, dp(6))
+        }, lp(-2, -2))
+        block(page, header, top)
+    }
+
+    private fun iconBadge(icon: Glyph, accent: Int) = FrameLayout(this).apply {
+        background = shape(ColorUtils.blendARGB(palette.surface, accent, .17f), 12)
+        addView(Icon(this@MainActivity, icon, accent), FrameLayout.LayoutParams(dp(19), dp(19), Gravity.CENTER))
+    }
+
+    private fun TextView.ignoreAccessibility() = apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }
 
     private fun heading(page: LinearLayout, text: String, top: Int) =
         block(page, label(text, 23, palette.ink, "sans-serif-medium").apply {
@@ -1237,8 +1570,8 @@ class MainActivity : ComponentActivity() {
         block(parent, label(text, 14, if (warning) palette.warning else palette.muted).apply { setLineSpacing(dp(2).toFloat(), 1f) }, top)
 
     private fun panel() = column().apply {
-        background = shape(palette.surface, 16)
-        setPadding(dp(15), dp(11), dp(15), dp(11))
+        background = shape(palette.surface, 15)
+        setPadding(dp(15), dp(9), dp(15), dp(9))
     }
 
     private fun iconButton(glyph: Glyph, description: String, enabled: Boolean, action: () -> Unit): FrameLayout {
@@ -1270,7 +1603,7 @@ class MainActivity : ComponentActivity() {
         stateListAnimator = null
         val bg = if (!enabled) palette.background else if (filled) palette.brand else palette.surface
         val fg = if (!enabled) palette.muted else if (filled) palette.onBrand else palette.brand
-        background = pressable(bg, fg, 12, if (!filled || !enabled) palette.border else null)
+        background = pressable(bg, fg, 13, if (!filled || !enabled) palette.border else null)
         setTextColor(fg)
         setPadding(dp(12), dp(8), dp(12), dp(8))
         isEnabled = enabled
@@ -1306,16 +1639,20 @@ class MainActivity : ComponentActivity() {
     private fun dateTime(time: Long, zone: ZoneId) = DATE_TIME.format(Instant.ofEpochMilli(time).atZone(zone))
 
     companion object {
-        private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH, Tab.ACTIVITY)
+        private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH)
         private val HEALTH_METRICS = listOf(Metric.HEART, Metric.OXYGEN, Metric.HRV, Metric.STRESS)
-        private val ACTIVITY_METRICS = listOf(Metric.STEPS, Metric.CALORIES, Metric.DISTANCE)
-        private val LONG_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL)
         private val SHORT_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)
+        private val SUMMARY_DATE get() = DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(
+            java.util.Locale.getDefault(), "EEEEMMMd"
+        ))
         private val TIME = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
         private val DATE_TIME = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT)
         private val MONTH_DAY get() = DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(
             java.util.Locale.getDefault(), "MMMd"
         ))
-        private val WEEKDAY = DateTimeFormatter.ofPattern("EEEEE")
+        private val MONTH_YEAR = DateTimeFormatter.ofPattern("MMM uuuu")
+        private val MONTH = DateTimeFormatter.ofPattern("MMM")
+        private val CHART_HOUR = DateTimeFormatter.ofPattern("HH")
+        private const val WORKOUT_PAGE_SIZE = 15
     }
 }

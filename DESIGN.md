@@ -1,9 +1,14 @@
-# OpenHK50 design
+# OpenHK50 Android design
 
-OpenHK50 is an Android band companion. Today pairs the daily step total and average heart rate above the step chart. Health, Activity, and History provide more detail. The app uses Android permissions, dialogs, back navigation, and system text sizing.
+- **Summary** shows today’s calories, logged workout minutes, steps, and distance. The open arcs use apricot, lavender, and mint in the same order as the labels. Yesterday’s steps and last night’s sleep lead to their daily histories. Seven-day averages use the previous seven complete local dates with readings.
+- **Navigation** groups Summary, Workouts, Health, and Band in a fixed bottom bar on phones and a rail on wide windows. History opens from the calendar or a metric and returns to the originating tab. Camera remote and Phone clock use dedicated views.
+- **Appearance** follows Android’s theme. Dark uses `#090B0A` for the canvas and `#181C1A` for panels. Light uses `#F0F4F0` and white. Labels and values carry the meaning of the colors. Keep native system bars, dialogs, back handling, and font scaling.
+- **Data** uses calories from the band’s activity packets and workout minutes from completed phone sessions. Workout time excludes pauses and is apportioned to the local days it crosses. Empty readings display a dash. History retains day, week, and year drill-down and keeps spot checks separate from historical averages.
+- **Band** groups connection and sync first, followed by device tools and settings. The tested HK50 has no screen or button. The phone provides the clock faces and workout controls. The wrist shutter works while Camera remote is open through the confirmed camera-mode event. See [HK50 hardware and protocol evidence](docs/reference/HK50.md).
 
-- **Navigation** uses Today, Health, Activity, History, and Band. Phones use a bottom bar and wider windows use a side rail. Tapping a reading opens that metric and date in History. Band contains device actions and backup.
-- **Typography** uses Android’s sans-serif family, a 44 sp screen title, 23 sp section headings, and tabular readings where values align.
-- **Color** uses an off-white canvas and forest controls in light mode, and pine charcoal with light green controls in dark mode. Heart rate uses coral, activity amber, oxygen teal, stress violet, and variability green.
-- **Band** puts the current connection, battery, and primary action together. Disconnected bands can be scanned or reconnected. Connected bands show sync and settings. Bluetooth and sync failures give the next action in context.
-- **Data** stays blank until the band supplies readings. Daily charts show the time of each reading. Weekly charts mark available days and open their daily details. Sleep shows stage durations with the timeline. Workouts show elapsed time and saved sessions.
+## Apple references
+
+- Fitness puts daily progress, steps, distance, recent sessions, and trends in Summary. Apple’s Stand metric requires detecting standing and movement by hour. OpenHK50 uses steps as its third goal. [Fitness Summary](https://support.apple.com/en-ie/guide/iphone/iph4c34a8a95/ios)
+- Apple groups workouts by activity and provides pause, resume, and end controls. Sleep exposes the previous night, history, and stage breakdowns. [Workout guide](https://support.apple.com/en-ie/guide/watch/apdd16e8761a/watchos) · [Sleep guide](https://support.apple.com/en-md/guide/watch/crpxel1lvun9/watchos)
+- Apple’s Watch companion manages devices, faces, and app arrangement. On the watch, the screen and Digital Crown handle navigation. OpenHK50 keeps device tools together and lets users switch the phone clock between digital and analog. [Watch setup](https://support.apple.com/en-us/109015) · [Face Gallery](https://support.apple.com/en-ie/guide/watch/apda6559ad78/watchos) · [App arrangement](https://support.apple.com/en-my/guide/watch/apd3cd8641c2/watchos) · [Watch controls](https://support.apple.com/en-us/105063)
+- Apple’s Camera Remote uses the watch to frame and trigger photos. OpenHK50 uses the phone preview with a wrist shutter, optional three-second countdown, and phone camera selection. [Camera Remote guide](https://support.apple.com/en-ie/guide/watch/apda6e61c287/watchos)

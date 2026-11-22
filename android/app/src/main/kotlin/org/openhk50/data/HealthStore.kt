@@ -7,25 +7,15 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.time.LocalDate
 import java.time.ZoneId
 
-class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 3) {
-    data class Day(
-        private val readings: Map<Metric, List<Reading>>, val sleep: SleepNight?, val earlier: Boolean
+class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 5) {
+    internal data class Day(
+        private val readings: Map<Metric, List<Aggregate>>, val sleep: SleepNight?, val earlier: Boolean,
+        val spot: Long? = null
     ) {
-        fun readings(metric: Metric) = readings[metric].orEmpty()
-
-        fun value(metric: Metric): Long? {
-            val samples = readings(metric)
-            if (samples.isEmpty()) return null
-            return if (metric.isTotal) samples.sumOf { it.value.toLong() }
-            else samples.last().value.toLong()
-        }
-
-        fun averageHeartRate(): Long? {
-            val samples = readings(Metric.HEART).filter { it.origin == Origin.HISTORY }
-            if (samples.isEmpty()) return null
-            return (samples.sumOf { it.value.toLong() } + samples.size / 2) / samples.size
-        }
+        fun buckets(metric: Metric) = readings[metric].orEmpty().map { it.value(metric.isTotal) }
+        fun value(metric: Metric) = readings[metric].orEmpty().combined().value(metric.isTotal)
     }
+    internal data class Trend(val buckets: List<Aggregate>, val earlier: Boolean)
     data class Checkpoint(val store: String, val cursor: Long)
 
     init { setWriteAheadLoggingEnabled(true) }
@@ -49,16 +39,29 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         """.trimIndent())
         createSleepTable(db)
         createWorkoutTable(db)
+        createWorkoutPauses(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createSleepTable(db)
         if (oldVersion < 3) createWorkoutTable(db)
+        if (oldVersion in 2..3) {
+            db.execSQL("ALTER TABLE sleep_nights ADD COLUMN asleep_minutes INTEGER NOT NULL DEFAULT 0")
+            db.rawQuery("SELECT band, day, segments FROM sleep_nights", null).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val asleep = decodeSleep(cursor.getBlob(2)).filter { it.stage != SleepStage.AWAKE }.sumOf { it.minutes }
+                    db.execSQL("UPDATE sleep_nights SET asleep_minutes=? WHERE band=? AND day=?",
+                        arrayOf(asleep, cursor.getString(0), cursor.getString(1)))
+                }
+            }
+        }
+        if (oldVersion < 5) createWorkoutPauses(db)
     }
 
     private fun createSleepTable(db: SQLiteDatabase) = db.execSQL("""
         CREATE TABLE sleep_nights (
             band TEXT NOT NULL, day TEXT NOT NULL, start_minute INTEGER NOT NULL, segments BLOB NOT NULL,
+            asleep_minutes INTEGER NOT NULL,
             PRIMARY KEY (band, day)
         ) WITHOUT ROWID
     """.trimIndent())
@@ -73,10 +76,18 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         db.execSQL("CREATE UNIQUE INDEX workouts_active ON workouts((1)) WHERE end_ms IS NULL")
     }
 
-    internal fun workouts(limit: Int): WorkoutLog {
+    private fun createWorkoutPauses(db: SQLiteDatabase) = db.execSQL("""
+        CREATE TABLE workout_pauses (
+            workout_ms INTEGER NOT NULL, pause_ms INTEGER NOT NULL,
+            resume_ms INTEGER CHECK(resume_ms >= pause_ms),
+            PRIMARY KEY (workout_ms, pause_ms)
+        ) WITHOUT ROWID
+    """.trimIndent())
+
+    internal fun workouts(limit: Int, offset: Int = 0): WorkoutLog {
         val db = readableDatabase
         val active = db.workoutRows("end_ms IS NULL", 1).firstOrNull()
-        val recorded = db.workoutRows("end_ms IS NOT NULL", limit + 1)
+        val recorded = if (limit == 0) emptyList() else db.workoutRows("end_ms IS NOT NULL", limit + 1, offset)
         return WorkoutLog(active, recorded.take(limit), recorded.size > limit)
     }
 
@@ -88,24 +99,65 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         }, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
-    internal fun endWorkout(start: Long, now: Long) {
-        writableDatabase.update("workouts", ContentValues(1).apply {
-            put("end_ms", now.coerceAtLeast(start))
-        }, "start_ms=? AND end_ms IS NULL", arrayOf(start.toString()))
+    internal fun pauseWorkout(start: Long, now: Long) {
+        writableDatabase.execSQL("""
+            INSERT OR IGNORE INTO workout_pauses (workout_ms, pause_ms)
+            SELECT start_ms, max(?, start_ms, coalesce((
+                SELECT max(resume_ms) FROM workout_pauses WHERE workout_ms=start_ms
+            ), start_ms)) FROM workouts WHERE start_ms=? AND end_ms IS NULL AND NOT EXISTS (
+                SELECT 1 FROM workout_pauses WHERE workout_ms=start_ms AND resume_ms IS NULL
+            )
+        """.trimIndent(), arrayOf(now, start))
     }
 
-    private fun SQLiteDatabase.workoutRows(filter: String, limit: Int) =
+    internal fun resumeWorkout(start: Long, now: Long) = closeWorkoutPause(writableDatabase, start, now)
+
+    internal fun endWorkout(start: Long, now: Long) = transaction { db ->
+        closeWorkoutPause(db, start, now)
+        db.execSQL("""
+            UPDATE workouts SET end_ms=max(?, start_ms, coalesce((
+                SELECT max(resume_ms) FROM workout_pauses WHERE workout_ms=start_ms
+            ), start_ms)) WHERE start_ms=? AND end_ms IS NULL
+        """.trimIndent(), arrayOf(now, start))
+    }
+
+    private fun closeWorkoutPause(db: SQLiteDatabase, start: Long, now: Long) = db.execSQL("""
+        UPDATE workout_pauses SET resume_ms=max(pause_ms, ?)
+        WHERE workout_ms=? AND resume_ms IS NULL
+    """.trimIndent(), arrayOf(now, start))
+
+    internal fun workoutMinutes(date: LocalDate, zone: ZoneId): Long {
+        val start = date.atStartOfDay(zone).toInstant().toEpochMilli().toString()
+        val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli().toString()
+        return readableDatabase.rawQuery("""
+            WITH bounds AS (SELECT CAST(? AS INTEGER) AS day_start, CAST(? AS INTEGER) AS day_end)
+            SELECT coalesce(sum(min(end_ms, day_end) - max(start_ms, day_start) - coalesce((
+                SELECT sum(min(resume_ms, day_end) - max(pause_ms, day_start)) FROM workout_pauses
+                WHERE workout_ms=start_ms AND pause_ms<day_end AND resume_ms>day_start
+            ), 0)), 0) FROM workouts CROSS JOIN bounds WHERE start_ms<day_end AND end_ms>day_start
+        """.trimIndent(), arrayOf(start, end)).use { cursor ->
+            cursor.moveToFirst()
+            cursor.getLong(0) / 60_000
+        }
+    }
+
+    private fun SQLiteDatabase.workoutRows(filter: String, limit: Int, offset: Int = 0) =
         rawQuery("""
             SELECT start_ms, type, end_ms, (
                 SELECT round(avg(value)) FROM readings
                 WHERE band=workouts.band AND kind='HEART' AND origin='HISTORY'
                 AND time_ms>=start_ms AND time_ms<=end_ms
-            ) FROM workouts WHERE $filter ORDER BY start_ms DESC LIMIT ?
-        """.trimIndent(), arrayOf(limit.toString())).use { cursor ->
+                AND NOT EXISTS (SELECT 1 FROM workout_pauses WHERE workout_ms=start_ms
+                    AND time_ms>=pause_ms AND time_ms<resume_ms)
+            ), (SELECT pause_ms FROM workout_pauses WHERE workout_ms=start_ms AND resume_ms IS NULL),
+               (SELECT coalesce(sum(resume_ms-pause_ms), 0) FROM workout_pauses WHERE workout_ms=start_ms)
+            FROM workouts WHERE $filter ORDER BY start_ms DESC LIMIT ? OFFSET ?
+        """.trimIndent(), arrayOf(limit.toString(), offset.toString())).use { cursor ->
             buildList {
                 while (cursor.moveToNext()) add(Workout(cursor.getLong(0), WorkoutType.valueOf(cursor.getString(1)),
                     if (cursor.isNull(2)) null else cursor.getLong(2),
-                    if (cursor.isNull(3)) null else cursor.getInt(3)))
+                    if (cursor.isNull(3)) null else cursor.getInt(3),
+                    if (cursor.isNull(4)) null else cursor.getLong(4), cursor.getLong(5)))
             }
         }
 
@@ -116,27 +168,74 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
     fun saveSleep(band: String, nights: List<SleepNight>) = transaction { db ->
         for (night in nights) {
             val segments = night.segments.flatMap { listOf(it.stage.ordinal.toByte(), it.minutes.toByte()) }.toByteArray()
-            db.insertWithOnConflict("sleep_nights", null, ContentValues(4).apply {
+            db.insertWithOnConflict("sleep_nights", null, ContentValues(5).apply {
                 put("band", band)
                 put("day", night.day.toString())
                 put("start_minute", night.startMinute)
                 put("segments", segments)
+                put("asleep_minutes", night.asleepMinutes)
             }, SQLiteDatabase.CONFLICT_REPLACE)
         }
     }
 
-    fun day(selected: String?, date: LocalDate, zone: ZoneId): Day {
+    internal fun day(selected: String?, date: LocalDate, zone: ZoneId, metric: Metric? = null,
+                     history: Boolean = false): Day {
         val db = readableDatabase
-        val band = selected ?: latestBand(db)
-        return if (band == null) Day(emptyMap(), null, false) else day(db, band, date, zone)
+        val band = selected ?: latestBand(db) ?: return Day(emptyMap(), null, false)
+        val bounds = dayBoundaries(date, zone)
+        val wantsReadings = !history || metric != null
+        val series = if (wantsReadings) readingBuckets(db, band, bounds, metric) else emptyMap()
+        val sleep = if (!history || metric == null) sleep(db, band, date) else null
+        val earlier = history && earlier(db, band, date, bounds.first(), metric)
+        val spot = metric?.takeIf { it.liveType != null }?.let {
+            db.rawQuery("""
+                SELECT value FROM readings WHERE band=? AND kind=? AND time_ms>=? AND time_ms<?
+                AND origin='LIVE' ORDER BY time_ms DESC, revision DESC LIMIT 1
+            """.trimIndent(), arrayOf(band, it.name, bounds.first().toString(), bounds.last().toString()))
+                .use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else null }
+        }
+        return Day(series, sleep, earlier, spot)
     }
 
-    fun week(selected: String?, date: LocalDate, zone: ZoneId): List<Pair<LocalDate, Day>> {
+    internal fun trend(selected: String?, dates: List<LocalDate>, end: LocalDate, zone: ZoneId, metric: Metric?): Trend {
         val db = readableDatabase
-        val band = selected ?: latestBand(db)
-        return (6L downTo 0).map { offset ->
-            val day = date.minusDays(offset)
-            day to if (band == null) Day(emptyMap(), null, false) else day(db, band, day, zone)
+        val band = selected ?: latestBand(db) ?: return Trend(List(dates.size) { Aggregate() }, false)
+        val days = dates + end.plusDays(1)
+        val bounds = days.map { it.atStartOfDay(zone).toInstant().toEpochMilli() }
+        val buckets = if (metric == null) sleepBuckets(db, band, days) else readingBuckets(db, band, bounds, metric)[metric]
+        return Trend(buckets ?: List(dates.size) { Aggregate() }, earlier(db, band, dates.first(), bounds.first(), metric))
+    }
+
+    private fun readingBuckets(db: SQLiteDatabase, band: String, bounds: List<Long>, metric: Metric?): Map<Metric, List<Aggregate>> {
+        val buckets = bounds.zipWithNext()
+        val filter = if (metric == null) "" else "AND kind=?"
+        val sql = buckets.indices.joinToString(" UNION ALL ") { index ->
+            "SELECT $index, kind, sum(value), count(*) FROM readings " +
+                "WHERE band=? $filter AND time_ms>=? AND time_ms<? AND origin='HISTORY' GROUP BY kind"
+        }
+        val args = buckets.flatMap { (start, end) ->
+            listOfNotNull(band, metric?.name, start.toString(), end.toString())
+        }
+        return db.rawQuery(sql, args.toTypedArray()).use { cursor ->
+            buildMap<Metric, MutableList<Aggregate>> {
+                while (cursor.moveToNext()) {
+                    val kind = Metric.valueOf(cursor.getString(1))
+                    getOrPut(kind) { MutableList(buckets.size) { Aggregate() } }[cursor.getInt(0)] =
+                        Aggregate(cursor.getLong(2), cursor.getLong(3))
+                }
+            }
+        }
+    }
+
+    private fun sleepBuckets(db: SQLiteDatabase, band: String, bounds: List<LocalDate>): List<Aggregate> {
+        val buckets = bounds.zipWithNext()
+        val sql = buckets.indices.joinToString(" UNION ALL ") { index ->
+            "SELECT $index AS bucket, coalesce(sum(asleep_minutes), 0), count(*) " +
+                "FROM sleep_nights WHERE band=? AND day>=? AND day<?"
+        } + " ORDER BY bucket"
+        val args = buckets.flatMap { (start, end) -> listOf(band, start.toString(), end.toString()) }
+        return db.rawQuery(sql, args.toTypedArray()).use { cursor ->
+            buildList { while (cursor.moveToNext()) add(Aggregate(cursor.getLong(1), cursor.getLong(2))) }
         }
     }
 
@@ -146,26 +245,20 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
             ?: db.rawQuery("SELECT band FROM sleep_nights ORDER BY day DESC LIMIT 1", null)
                 .use { if (it.moveToFirst()) it.getString(0) else null }
 
-    private fun day(db: SQLiteDatabase, band: String, date: LocalDate, zone: ZoneId): Day {
-        val start = date.atStartOfDay(zone).toInstant().toEpochMilli().toString()
-        val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli().toString()
-        val rows = read(db, "band=? AND time_ms>=? AND time_ms<?", arrayOf(band, start, end), "time_ms ASC")
-        val earlier = db.rawQuery("""
-            SELECT 1 FROM readings WHERE band=? AND time_ms<?
-            UNION ALL SELECT 1 FROM sleep_nights WHERE band=? AND day<? LIMIT 1
-        """.trimIndent(), arrayOf(band, start, band, date.toString()))
-            .use { it.moveToFirst() }
-        val sleep = db.rawQuery("SELECT start_minute, segments FROM sleep_nights WHERE band=? AND day=?",
-            arrayOf(band, date.toString())).use { cursor ->
-            if (!cursor.moveToFirst()) null else {
-                val bytes = cursor.getBlob(1)
-                val segments = (0 until bytes.lastIndex step 2).map { i ->
-                    SleepSegment(SleepStage.entries[bytes[i].toInt()], bytes[i + 1].toInt() and 255)
-                }
-                SleepNight(date, cursor.getInt(0), segments)
-            }
-        }
-        return Day(rows.groupBy { it.metric }, sleep, earlier)
+    private fun earlier(db: SQLiteDatabase, band: String, date: LocalDate, start: Long, metric: Metric?) =
+        if (metric == null) db.rawQuery("SELECT 1 FROM sleep_nights WHERE band=? AND day<? LIMIT 1",
+            arrayOf(band, date.toString())).use { it.moveToFirst() }
+        else db.rawQuery("SELECT 1 FROM readings WHERE band=? AND kind=? AND time_ms<? LIMIT 1",
+            arrayOf(band, metric.name, start.toString())).use { it.moveToFirst() }
+
+    private fun sleep(db: SQLiteDatabase, band: String, date: LocalDate) = db.rawQuery(
+        "SELECT start_minute, segments FROM sleep_nights WHERE band=? AND day=?", arrayOf(band, date.toString())
+    ).use { cursor ->
+        if (cursor.moveToFirst()) SleepNight(date, cursor.getInt(0), decodeSleep(cursor.getBlob(1))) else null
+    }
+
+    private fun decodeSleep(bytes: ByteArray) = (0 until bytes.lastIndex step 2).map { i ->
+        SleepSegment(SleepStage.entries[bytes[i].toInt()], bytes[i + 1].toInt() and 255)
     }
 
     fun pendingCount(): Long = readableDatabase.rawQuery("SELECT count(*) FROM readings WHERE pending=1", null)
