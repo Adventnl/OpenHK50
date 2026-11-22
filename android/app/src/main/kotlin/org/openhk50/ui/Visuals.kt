@@ -92,6 +92,21 @@ internal fun Context.shape(color: Int, radius: Int, stroke: Int? = null) = Gradi
     if (stroke != null) setStroke(dp(1), stroke)
 }
 
+internal fun Context.navigationGlass(palette: Palette, radius: Int, selected: Boolean = false): GradientDrawable {
+    val colors = if (selected) {
+        if (palette.night) intArrayOf(0xff395347.toInt(), 0xff25392f.toInt())
+        else intArrayOf(0xffedf9f1.toInt(), 0xffd5eadc.toInt())
+    } else {
+        if (palette.night) intArrayOf(0xee283a33.toInt(), 0xe116231e.toInt())
+        else intArrayOf(0xf8ffffff.toInt(), 0xe7e4f0e8.toInt())
+    }
+    val rim = if (palette.night) 0x4ddef6e7 else 0xfaffffff.toInt()
+    return GradientDrawable(GradientDrawable.Orientation.TL_BR, colors).apply {
+        cornerRadius = dp(radius).toFloat()
+        setStroke(dp(1), rim)
+    }
+}
+
 internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = null) = RippleDrawable(
     ColorStateList.valueOf((ink and 0x00ffffff) or 0x22000000),
     shape(fill, radius, stroke), shape(Color.WHITE, radius)

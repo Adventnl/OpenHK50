@@ -61,7 +61,7 @@ import java.time.format.FormatStyle
 
 class MainActivity : ComponentActivity() {
     private enum class Tab(val title: String, val icon: Glyph, val inNavigation: Boolean = true) {
-        TODAY("Summary", Glyph.TODAY), ACTIVITY("Workouts", Glyph.WALK), HEALTH("Health", Glyph.PULSE),
+        TODAY("Today", Glyph.TODAY), ACTIVITY("Workouts", Glyph.WALK), HEALTH("Health", Glyph.PULSE),
         BAND("Band", Glyph.BAND), HISTORY("History", Glyph.CALENDAR, false),
         WORKOUT_TYPES("Choose workout", Glyph.WALK, false), BACKUP("Backup", Glyph.BACKUP, false),
         CAMERA("Camera remote", Glyph.CAMERA, false), CLOCK("Phone clock", Glyph.CLOCK, false)
@@ -78,7 +78,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var palette: Palette
     private lateinit var root: FrameLayout
     private lateinit var content: FrameLayout
-    private lateinit var navigationShell: LinearLayout
     private lateinit var navigation: LinearLayout
     private var scroll: ScrollView? = null
     private var tab = Tab.TODAY
@@ -285,53 +284,63 @@ class MainActivity : ComponentActivity() {
             insets
         }
 
-        val shell = if (expanded) row() else column()
-        root.addView(shell, FrameLayout.LayoutParams(-1, -1))
-        content = FrameLayout(this).apply { setBackgroundColor(palette.background) }
-        navigation = if (expanded) column() else row()
-        navigationShell = column().apply {
-            setBackgroundColor(palette.surface)
-            if (!expanded) divider(this)
-            addView(navigation, lp(-1, -2))
+        content = FrameLayout(this)
+        root.addView(content, FrameLayout.LayoutParams(-1, -1))
+        navigation = (if (expanded) column() else row()).apply {
+            background = navigationGlass(palette, if (expanded) 24 else 30)
+            elevation = dp(6).toFloat()
+            setPadding(dp(5), dp(5), dp(5), dp(5))
+            addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
+                if (bottom - top != oldBottom - oldTop) updateScrollInsets()
+            }
         }
-        if (expanded) {
-            shell.addView(navigationShell, lp(dp(100), -1))
-            shell.addView(content, lp(0, -1, 1f))
+        val placement = if (expanded) {
+            FrameLayout.LayoutParams(dp(96), -2, Gravity.START or Gravity.TOP).apply {
+                marginStart = dp(12)
+                topMargin = dp(12)
+            }
         } else {
-            shell.addView(content, lp(-1, 0, 1f))
-            shell.addView(navigationShell, lp(-1, -2))
+            FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                marginStart = dp(14)
+                marginEnd = dp(14)
+                bottomMargin = dp(9)
+            }
         }
+        root.addView(navigation, placement)
         drawNavigation()
         updateBack()
     }
 
+    private fun updateScrollInsets() {
+        val viewport = scroll ?: return
+        val side = if (expanded) dp(RAIL_SPACE) else 0
+        val bottom = if (expanded) 0 else maxOf(navigation.height, dp(60)) + dp(9)
+        viewport.setPaddingRelative(side, 0, 0, bottom)
+    }
+
     private fun drawNavigation() {
         navigation.removeAllViews()
-        navigationShell.visibility = if (tab == Tab.CAMERA || tab == Tab.CLOCK) View.GONE else View.VISIBLE
-        navigation.setPadding(dp(7), dp(if (expanded) 16 else 5), dp(7), dp(5))
+        navigation.visibility = if (tab == Tab.CAMERA || tab == Tab.CLOCK) View.GONE else View.VISIBLE
         for (item in Tab.entries.filter { it.inNavigation }) {
             val selected = item == tab || (!tab.inNavigation && item == backDestination())
             val color = if (selected) palette.brand else palette.muted
             val cell = column().apply {
                 gravity = Gravity.CENTER
-                minimumHeight = dp(if (expanded) 68 else 51)
-                setPadding(dp(1), dp(5), dp(1), dp(5))
+                minimumHeight = dp(if (expanded) 58 else 52)
+                setPadding(dp(2), dp(5), dp(2), dp(5))
                 contentDescription = item.title
                 isSelected = selected
                 isFocusable = true
-                background = pressable(Color.TRANSPARENT, palette.ink, 14)
+                if (selected) background = navigationGlass(palette, 24, selected = true)
+                foreground = pressable(Color.TRANSPARENT, palette.ink, 24)
                 setOnClickListener { go(item) }
             }
-            val capsule = FrameLayout(this).apply {
-                if (selected) background = shape(palette.tint, 16)
-                addView(Icon(this@MainActivity, item.icon, color), FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
-            }
-            cell.addView(capsule, lp(dp(50), dp(27)))
+            cell.addView(Icon(this, item.icon, color), lp(dp(21), dp(21)))
             cell.addView(label(item.title, 12, color, if (selected) "sans-serif-medium" else "sans-serif")
                 .apply {
                     gravity = Gravity.CENTER
                     importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                }, lp(-1, -2).apply { topMargin = dp(3) })
+                }, lp(-1, -2).apply { topMargin = dp(4) })
             navigation.addView(cell, if (expanded) lp(-1, -2) else lp(0, -2, 1f))
         }
     }
@@ -450,10 +459,12 @@ class MainActivity : ComponentActivity() {
         app.main.removeCallbacks(tickWorkout)
         workoutTimer = null
         if (tab == Tab.CAMERA) {
+            scroll = null
             if (camera == null) cameraScreen()
             return
         }
         if (tab == Tab.CLOCK) {
+            scroll = null
             clockScreen()
             return
         }
@@ -462,15 +473,17 @@ class MainActivity : ComponentActivity() {
         val viewport = ScrollView(this).apply {
             isFillViewport = true
             isVerticalScrollBarEnabled = false
+            clipToPadding = false
         }
         val center = FrameLayout(this)
-        val pageWidth = if (expanded) (resources.configuration.screenWidthDp - 100).coerceAtMost(680) else -1
-        center.addView(page, FrameLayout.LayoutParams(if (pageWidth == -1) -1 else dp(pageWidth), -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+        val pageWidth = if (expanded && resources.configuration.screenWidthDp - RAIL_SPACE > 680) dp(680) else -1
+        center.addView(page, FrameLayout.LayoutParams(pageWidth, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
         viewport.addView(center, FrameLayout.LayoutParams(-1, -2))
         scroll = viewport
+        updateScrollInsets()
         content.removeAllViews()
         content.addView(viewport, FrameLayout.LayoutParams(-1, -1))
-        if (tab != Tab.TODAY) pageHeader(page)
+        if (!tab.inNavigation) pageHeader(page)
         when (tab) {
             Tab.TODAY -> today(page)
             Tab.HEALTH -> health(page)
@@ -488,18 +501,11 @@ class MainActivity : ComponentActivity() {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
         val day = currentDay
-        val header = row()
-        val name = column()
-        name.addView(screenTitle("Summary"))
-        note(name, today.format(SUMMARY_DATE), 5)
-        header.addView(name, lp(0, -2, 1f))
-        header.addView(iconButton(Glyph.CALENDAR, "Activity history", true) {
+        val calendar = iconButton(Glyph.CALENDAR, "Activity history", true) {
             openHistory(Metric.STEPS, today)
-        }.apply { background = pressable(palette.surface, palette.ink, 16) }, lp(dp(48), dp(48)))
-        block(page, header, 0)
+        }
         showReadIssues(page)
-
-        sectionHeader(page, "Activity", "Goals", 20, ::editGoals)
+        sectionHeader(page, "Activity", "Goals", 0, trailing = calendar, open = ::editGoals)
         val activity = panel()
         val values = listOf(day?.value(Metric.CALORIES), summary?.workoutMinutes, day?.value(Metric.STEPS))
         val goals = Goal.entries.mapIndexed { index, goal ->
@@ -677,7 +683,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun activity(page: LinearLayout) {
-        workoutControl(page, 10)
+        workoutControl(page, 0)
         showReadIssues(page)
         val log = workouts
         heading(page, "Recent sessions", 22)
@@ -1510,16 +1516,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun screenTitle(text: String) = label(text, 36, palette.ink, "sans-serif-medium").apply {
-        letterSpacing = -.035f
-        if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
-    }
-
     private fun pageHeader(page: LinearLayout) {
-        if (tab.inNavigation) {
-            block(page, screenTitle(tab.title), 0)
-            return
-        }
         val bar = row()
         val parent = backDestination()
         bar.addView(iconButton(Glyph.LEFT, "Back to ${parent.title}", true) { go(parent) }, lp(dp(48), dp(48)))
@@ -1529,7 +1526,7 @@ class MainActivity : ComponentActivity() {
         block(page, bar, 0)
     }
 
-    private fun sectionHeader(page: LinearLayout, title: String, action: String, top: Int, open: () -> Unit) {
+    private fun sectionHeader(page: LinearLayout, title: String, action: String, top: Int, trailing: View? = null, open: () -> Unit) {
         val header = row()
         header.addView(label(title, 22, palette.ink, "sans-serif-medium").apply {
             letterSpacing = -.025f
@@ -1539,6 +1536,7 @@ class MainActivity : ComponentActivity() {
             background = pressable(Color.TRANSPARENT, palette.brand, 12)
             setPadding(dp(11), dp(6), 0, dp(6))
         }, lp(-2, -2))
+        trailing?.let { header.addView(it, lp(dp(48), dp(48)).apply { marginStart = dp(8) }) }
         block(page, header, top)
     }
 
@@ -1642,9 +1640,6 @@ class MainActivity : ComponentActivity() {
         private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH)
         private val HEALTH_METRICS = listOf(Metric.HEART, Metric.OXYGEN, Metric.HRV, Metric.STRESS)
         private val SHORT_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)
-        private val SUMMARY_DATE get() = DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(
-            java.util.Locale.getDefault(), "EEEEMMMd"
-        ))
         private val TIME = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
         private val DATE_TIME = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT)
         private val MONTH_DAY get() = DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(
@@ -1653,6 +1648,7 @@ class MainActivity : ComponentActivity() {
         private val MONTH_YEAR = DateTimeFormatter.ofPattern("MMM uuuu")
         private val MONTH = DateTimeFormatter.ofPattern("MMM")
         private val CHART_HOUR = DateTimeFormatter.ofPattern("HH")
+        private const val RAIL_SPACE = 108
         private const val WORKOUT_PAGE_SIZE = 15
     }
 }
