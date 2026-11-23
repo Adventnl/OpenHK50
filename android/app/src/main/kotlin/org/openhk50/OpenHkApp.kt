@@ -4,6 +4,7 @@ import android.app.Application
 import android.database.sqlite.SQLiteException
 import android.os.Handler
 import android.os.Looper
+import org.openhk50.alerts.PhoneVibration
 import org.openhk50.band.BandClient
 import org.openhk50.data.HealthStore
 import org.openhk50.sync.BackupSettings
@@ -15,6 +16,7 @@ class OpenHkApp : Application() {
     internal val databaseThread = Executors.newSingleThreadExecutor()
     internal val backupThread = Executors.newSingleThreadExecutor()
     internal val health by lazy { HealthStore(this) }
+    internal val phoneVibration by lazy { PhoneVibration(this) }
     internal val settings by lazy { BackupSettings(this) }
     internal val backup by lazy { BackupSync(health, settings, ::notifyChanged) }
     internal var changed: (() -> Unit)? = null

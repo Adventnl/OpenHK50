@@ -2,8 +2,7 @@ package org.openhk50.ui
 
 import android.annotation.SuppressLint
 import android.Manifest
-import android.app.AlertDialog
-import android.app.DatePickerDialog
+import android.app.Dialog
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -19,12 +18,15 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.Window
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.TextClock
 import android.window.OnBackInvokedCallback
@@ -34,6 +36,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.core.content.edit
 import androidx.core.graphics.ColorUtils
+import androidx.core.net.toUri
+import androidx.core.view.isNotEmpty
 import org.openhk50.BuildConfig
 import org.openhk50.OpenHkApp
 import org.openhk50.band.BandAction
@@ -57,16 +61,21 @@ import java.text.NumberFormat
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
+import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
+import java.time.format.TextStyle
+import java.time.temporal.WeekFields
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private enum class Tab(val title: String, val icon: Glyph, val inNavigation: Boolean = true) {
         TODAY("Today", Glyph.TODAY), ACTIVITY("Workouts", Glyph.WALK), HEALTH("Health", Glyph.PULSE),
         BAND("Band", Glyph.BAND), HISTORY("History", Glyph.CALENDAR, false),
         WORKOUT_TYPES("Choose workout", Glyph.WALK, false), BACKUP("Backup", Glyph.BACKUP, false),
-        CAMERA("Camera remote", Glyph.CAMERA, false), CLOCK("Phone clock", Glyph.CLOCK, false)
+        CAMERA("Camera remote", Glyph.CAMERA, false), CLOCK("Phone clock", Glyph.CLOCK, false),
+        MEASURE("Measure", Glyph.PULSE, false), VIBRATION("Phone vibration", Glyph.PHONE, false)
     }
     private enum class PermissionAction { SCAN, RECONNECT }
     private enum class Goal(val title: String, val unit: String, val target: Int, val max: Int, val metric: Metric?) {
@@ -95,6 +104,10 @@ class MainActivity : ComponentActivity() {
     private var workoutPage = 0
     private var workoutTimer: TextView? = null
     private var workoutCalories: TextView? = null
+    private var popup: Dialog? = null
+    private var measureMetric = Metric.HEART
+    private var pendingMeasurement = false
+    private var renderMeasurement: ((BandState) -> Unit)? = null
     private val workoutEnergyProfile = BuildConfig.WORKOUT_WEIGHT_KG?.let { weight ->
         BuildConfig.WORKOUT_BODY_FAT_PERCENT?.let { bodyFat -> WorkoutEnergyProfile(weight, bodyFat) }
     }
@@ -151,6 +164,11 @@ class MainActivity : ComponentActivity() {
         if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) startCallAlerts()
         else permissionSettings("Phone access", "Allow phone access to relay incoming calls to the band.")
     }
+    private val vibrationCallPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) app.phoneVibration.setCalls(true)
+        else permissionSettings("Phone access", "Allow phone access to vibrate while calls ring.")
+        if (tab == Tab.VIBRATION) drawScreen(keepScroll = true)
+    }
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         cameraPermissionPending = false
         if (!granted) permissionSettings("Camera access", "Allow access to the phone camera to take photos.")
@@ -171,6 +189,7 @@ class MainActivity : ComponentActivity() {
         historyDate = savedInstanceState?.getString("day")?.let(LocalDate::parse) ?: LocalDate.now(band.zone)
         historyPeriod = savedInstanceState?.getString("period")?.let(HistoryPeriod::valueOf) ?: HistoryPeriod.DAY
         workoutPage = savedInstanceState?.getInt("workoutPage") ?: 0
+        measureMetric = savedInstanceState?.getString("measureMetric")?.let(Metric::valueOf) ?: Metric.HEART
         historyMetric = when (val metric = savedInstanceState?.getString("metric")) {
             null -> Metric.HEART
             "SLEEP" -> null
@@ -186,7 +205,11 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         active = true
         app.changed = {
-            if (tab == Tab.BAND) drawScreen(keepScroll = true) else loadData()
+            when (tab) {
+                Tab.BAND -> drawScreen(keepScroll = true)
+                Tab.MEASURE -> renderMeasurement?.invoke(band.state)
+                else -> loadData()
+            }
         }
         band.changed = {
             val device = band.state.device?.address
@@ -204,9 +227,11 @@ class MainActivity : ComponentActivity() {
             }
             if (tab == Tab.CAMERA) {
                 camera?.update()
-            } else if (tab == Tab.BAND) drawScreen(keepScroll = true)
+            } else if (tab == Tab.MEASURE) updateMeasurement()
+            else if (tab == Tab.BAND) drawScreen(keepScroll = true)
         }
         band.foreground(true)
+        if (tab == Tab.MEASURE) updateMeasurement()
         if (app.settings.state().endpoint != null) BackupJob.schedule(this)
         loadData()
         app.main.postDelayed(checkDay, 30_000)
@@ -217,6 +242,7 @@ class MainActivity : ComponentActivity() {
         resumed = true
         if (tab == Tab.CAMERA && !phoneCameraAvailable()) go(Tab.BAND)
         else camera?.resume(true)
+        if (tab == Tab.VIBRATION) drawScreen(keepScroll = true)
     }
 
     override fun onPause() {
@@ -232,10 +258,12 @@ class MainActivity : ComponentActivity() {
         band.changed = null
         app.main.removeCallbacks(tickWorkout)
         app.main.removeCallbacks(checkDay)
+        if (tab == Tab.MEASURE && !isChangingConfigurations) stopHealthMeasurement()
         if (!isChangingConfigurations && permissionAction == null && !cameraPermissionPending) band.foreground(false)
     }
 
     override fun onDestroy() {
+        popup?.dismiss()
         camera?.close()
         if (Build.VERSION.SDK_INT >= 33) backCallback?.let(onBackInvokedDispatcher::unregisterOnBackInvokedCallback)
         super.onDestroy()
@@ -247,6 +275,7 @@ class MainActivity : ComponentActivity() {
         outState.putString("day", historyDate.toString())
         outState.putString("period", historyPeriod.name)
         outState.putInt("workoutPage", workoutPage)
+        outState.putString("measureMetric", measureMetric.name)
         outState.putString("metric", historyMetric?.name ?: "SLEEP")
         outState.putString("permission", permissionAction?.name)
         super.onSaveInstanceState(outState)
@@ -353,6 +382,7 @@ class MainActivity : ComponentActivity() {
 
     private fun go(next: Tab) {
         if (tab == next) return
+        if (tab == Tab.MEASURE) stopHealthMeasurement()
         val previousCamera = camera
         camera = null
         if (next == Tab.HISTORY || next == Tab.WORKOUT_TYPES) detailParent = tab
@@ -370,7 +400,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun backDestination() = when (tab) {
-        Tab.BACKUP, Tab.CAMERA, Tab.CLOCK -> Tab.BAND
+        Tab.BACKUP, Tab.CAMERA, Tab.CLOCK, Tab.VIBRATION -> Tab.BAND
+        Tab.MEASURE -> Tab.HEALTH
         Tab.HISTORY, Tab.WORKOUT_TYPES -> detailParent
         else -> Tab.TODAY
     }
@@ -395,7 +426,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadData() {
-        if (!active || tab in setOf(Tab.BAND, Tab.CAMERA, Tab.CLOCK, Tab.WORKOUT_TYPES)) return
+        if (!active || tab in setOf(Tab.BAND, Tab.CAMERA, Tab.CLOCK, Tab.WORKOUT_TYPES, Tab.MEASURE, Tab.VIBRATION)) return
         val generation = ++queryGeneration
         val address = band.state.device?.address
         val zone = band.zone
@@ -465,6 +496,7 @@ class MainActivity : ComponentActivity() {
         app.main.removeCallbacks(tickWorkout)
         workoutTimer = null
         workoutCalories = null
+        renderMeasurement = null
         if (tab == Tab.CAMERA) {
             scroll = null
             if (camera == null) cameraScreen()
@@ -499,6 +531,8 @@ class MainActivity : ComponentActivity() {
             Tab.BAND -> bandPage(page)
             Tab.BACKUP -> backupPage(page)
             Tab.WORKOUT_TYPES -> workoutTypes(page)
+            Tab.MEASURE -> measurementPage(page)
+            Tab.VIBRATION -> vibrationPage(page)
             Tab.CAMERA, Tab.CLOCK -> Unit
         }
         if (previous > 0) viewport.post { viewport.scrollTo(0, previous) }
@@ -594,11 +628,11 @@ class MainActivity : ComponentActivity() {
         }
 
         sectionHeader(page, "7-day trends", "History", 17) {
-            openHistory(Metric.STEPS, today.minusDays(1), HistoryPeriod.WEEK)
+            openHistory(Metric.STEPS, today.minusDays(1))
         }
         val trends = panel()
         trends.addView(summaryRow("Average daily steps", Glyph.STEPS, summary?.averageSteps?.let(::number)) {
-            openHistory(Metric.STEPS, today.minusDays(1), HistoryPeriod.WEEK)
+            openHistory(Metric.STEPS, today.minusDays(1))
         }, lp(-1, -2))
         divider(trends)
         trends.addView(summaryRow("Average sleep", Glyph.MOON, summary?.averageSleep?.let { duration(it.toInt()) }) {
@@ -631,33 +665,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun editGoals() {
-        val fields = column().apply { setPadding(dp(24), dp(4), dp(24), dp(10)) }
         val digits = NumberFormat.getIntegerInstance().apply { isGroupingUsed = false }
-        val inputs = Goal.entries.associateWith { goal ->
-            val name = if (goal == Goal.STEPS) goal.title else "${goal.title} (${goal.unit})"
-            val field = EditText(this).apply {
-                id = View.generateViewId()
-                inputType = InputType.TYPE_CLASS_NUMBER
-                hint = name
-                setSingleLine()
-                setText(digits.format(displayPrefs.getInt(goal.name, goal.target)))
-                setSelectAllOnFocus(true)
+        showPopup("Daily goals") { dialog ->
+            val inputs = Goal.entries.associateWith { goal ->
+                val name = if (goal == Goal.STEPS) goal.title else "${goal.title} (${goal.unit})"
+                val field = popupInput(name, InputType.TYPE_CLASS_NUMBER).apply {
+                    setText(digits.format(displayPrefs.getInt(goal.name, goal.target)))
+                    setSelectAllOnFocus(true)
+                }
+                block(this, label(name, 14, palette.muted).apply { labelFor = field.id }, 10)
+                block(this, field, 5)
+                field
             }
-            fields.addView(label(name, 14, palette.muted).apply { labelFor = field.id }, lp(-1, -2).apply { topMargin = dp(10) })
-            fields.addView(field, lp(-1, -2))
-            field
-        }
-        val dialog = AlertDialog.Builder(this).setTitle("Daily goals").setView(ScrollView(this).apply { addView(fields) })
-            .setNegativeButton("Cancel", null).setPositiveButton("Save", null).create()
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            popupActions(this, dialog, "Save") {
                 val values = mutableMapOf<Goal, Int>()
                 for ((goal, input) in inputs) {
                     val value = input.text.toString().toIntOrNull()
                     if (value == null || value !in 1..goal.max) {
                         input.error = "Enter a number from 1 to ${number(goal.max.toLong())}."
                         input.requestFocus()
-                        return@setOnClickListener
+                        return@popupActions
                     }
                     values[goal] = value
                 }
@@ -666,7 +693,6 @@ class MainActivity : ComponentActivity() {
                 drawScreen(keepScroll = true)
             }
         }
-        dialog.show()
     }
 
     private fun showReadIssues(page: LinearLayout) {
@@ -677,6 +703,7 @@ class MainActivity : ComponentActivity() {
     private fun health(page: LinearLayout) {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
+        addButton(page, "Measure", top = 0, action = ::chooseMeasurement)
         heading(page, "Daily averages", 15)
         showReadIssues(page)
         val day = currentDay
@@ -687,6 +714,82 @@ class MainActivity : ComponentActivity() {
         }
         block(page, metrics, 10)
         block(page, sleepPanel(day?.sleep, today), 14)
+    }
+
+    private fun chooseMeasurement() {
+        val metrics = HEALTH_METRICS.filter { it.liveType != null }
+        showChoices("Measure", metrics.map { Choice(it.title, it.icon) }) { index ->
+            measureMetric = metrics[index]
+            pendingMeasurement = band.state.connection == Connection.CONNECTED
+            go(Tab.MEASURE)
+            updateMeasurement()
+        }
+    }
+
+    private fun updateMeasurement() {
+        if (pendingMeasurement) {
+            val state = band.state
+            if (state.connection != Connection.CONNECTED) pendingMeasurement = false
+            else if (state.action == BandAction.IDLE) {
+                pendingMeasurement = false
+                band.measure(measureMetric)
+            }
+        }
+        renderMeasurement?.invoke(band.state)
+    }
+
+    private fun stopHealthMeasurement() {
+        pendingMeasurement = false
+        band.stopMeasurement()
+    }
+
+    private fun measurementPage(page: LinearLayout) {
+        val metric = measureMetric
+        val live = panel()
+        section(live, metric.icon, metric.title, palette.brand)
+        val value = readout("—", size = 54)
+        val status = label("", 14, palette.muted).apply {
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        block(live, value, 14)
+        block(live, status, 5)
+        val start = button("Start measurement", filled = true) { band.measure(metric) }
+        val stop = button("Stop measurement", filled = false) {
+            stopHealthMeasurement()
+            updateMeasurement()
+        }
+        val connect = button("Open Band", filled = false) { go(Tab.BAND) }
+        block(live, start, 14)
+        block(live, stop, 14)
+        block(live, connect, 14)
+        block(page, live, 12)
+        renderMeasurement = { state ->
+            val connected = state.connection == Connection.CONNECTED
+            val selected = state.measurement == metric
+            val measuring = selected && state.action == BandAction.MEASURING
+            val reading = state.liveValue?.takeIf { selected && !pendingMeasurement }
+            value.text = reading?.let { readoutText(number(it.toLong()), metric.unit) } ?: "—"
+            val message = when {
+                !connected -> "Connect your band to measure."
+                pendingMeasurement -> "Waiting for the band…"
+                measuring && state.measurementStopping -> "Stopping…"
+                measuring && reading == null -> "Keep your wrist still."
+                measuring -> "Live"
+                selected && state.measurementMessage != null -> state.measurementMessage
+                reading != null && app.storageIssue != null -> app.storageIssue
+                state.action != BandAction.IDLE -> "Band is busy. Try again when it’s ready."
+                reading != null -> "Spot check"
+                else -> null
+            }
+            if (status.text != message.orEmpty()) status.text = message.orEmpty()
+            status.visibility = if (message == null) View.GONE else View.VISIBLE
+            start.visibility = if (connected && !measuring && !pendingMeasurement) View.VISIBLE else View.GONE
+            start.isEnabled = state.action == BandAction.IDLE
+            stop.visibility = if (measuring || pendingMeasurement) View.VISIBLE else View.GONE
+            stop.isEnabled = !state.measurementStopping
+            connect.visibility = if (connected) View.GONE else View.VISIBLE
+        }
+        renderMeasurement?.invoke(band.state)
     }
 
     private fun activity(page: LinearLayout) {
@@ -883,13 +986,13 @@ class MainActivity : ComponentActivity() {
                 lp(0, -2, 1f).apply { marginStart = dp(11) })
             addView(Icon(this@MainActivity, Glyph.DOWN, palette.ink), lp(dp(19), dp(19)))
             setOnClickListener {
-                AlertDialog.Builder(this@MainActivity).setTitle("Metric")
-                    .setSingleChoiceItems((Metric.entries.map { it.title } + "Sleep").toTypedArray(),
-                        metric?.ordinal ?: Metric.entries.size) { dialog, which ->
-                        historyMetric = Metric.entries.getOrNull(which)
-                        dialog.dismiss()
-                        selectDate(historyDate)
-                    }.setNegativeButton("Cancel", null).show()
+                val choices = Metric.entries.map { Choice(it.title, it.icon, it == metric) } +
+                    Choice("Sleep", Glyph.MOON, metric == null)
+                showChoices("Metric", choices) { index ->
+                    val chosen = Metric.entries.getOrNull(index)
+                    if (chosen != metric) openHistory(chosen, historyDate,
+                        if (chosen == Metric.STEPS) HistoryPeriod.DAY else period)
+                }
             }
         }
         block(page, picker, 12)
@@ -931,14 +1034,7 @@ class MainActivity : ComponentActivity() {
             contentDescription = "Choose date, $dateText"
             background = pressable(Color.TRANSPARENT, palette.ink, 12)
             isFocusable = true
-            setOnClickListener {
-                DatePickerDialog(this@MainActivity, { _, y, m, d -> selectDate(LocalDate.of(y, m + 1, d)) },
-                    historyDate.year, historyDate.monthValue - 1, historyDate.dayOfMonth
-                ).apply {
-                    datePicker.maxDate = today.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli() - 1
-                    show()
-                }
-            }
+            setOnClickListener { chooseDate(historyDate, today) }
         }
         dateRow.addView(date, lp(0, -2, 1f))
         dateRow.addView(iconButton(Glyph.RIGHT, "Next period", end < today) {
@@ -1067,6 +1163,76 @@ class MainActivity : ComponentActivity() {
         loadData()
     }
 
+    private fun chooseDate(day: LocalDate, today: LocalDate, openingMonth: YearMonth = YearMonth.from(day)) {
+        val latest = YearMonth.from(today)
+        val earliest = YearMonth.of(minOf(2000, day.year), 1)
+        val locale = Locale.getDefault()
+        val firstDay = WeekFields.of(locale).firstDayOfWeek
+        val monthFormat = DateTimeFormatter.ofPattern("LLLL uuuu", locale)
+        val fullDate = DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL)
+        var month = openingMonth
+        showPopup("Choose date") { dialog ->
+            val calendar = column()
+            block(this, calendar, 0)
+
+            fun drawMonth() {
+                calendar.removeAllViews()
+                val header = row()
+                header.addView(iconButton(Glyph.LEFT, "Previous month", month > earliest) {
+                    month = month.minusMonths(1)
+                    drawMonth()
+                }, lp(dp(44), dp(48)))
+                header.addView(button(month.format(monthFormat), filled = false) {
+                    val years = (latest.year downTo earliest.year).toList()
+                    showChoices("Choose year", years.map { Choice(it.toString(), Glyph.CALENDAR, it == month.year) }) {
+                        val target = month.withYear(years[it]).coerceAtMost(latest)
+                        chooseDate(day, today, target)
+                    }
+                }.apply { contentDescription = "${month.format(monthFormat)}, choose year" }, lp(0, -2, 1f))
+                header.addView(iconButton(Glyph.RIGHT, "Next month", month < latest) {
+                    month = month.plusMonths(1)
+                    drawMonth()
+                }, lp(dp(44), dp(48)))
+                block(calendar, header, 0)
+
+                val weekdays = row()
+                for (offset in 0L..6L) {
+                    weekdays.addView(label(firstDay.plus(offset).getDisplayName(TextStyle.NARROW, locale), 13, palette.muted)
+                        .apply { gravity = Gravity.CENTER }, lp(0, dp(28), 1f))
+                }
+                block(calendar, weekdays, 5)
+                val offset = (month.atDay(1).dayOfWeek.value - firstDay.value + 7) % 7
+                val cells = offset + month.lengthOfMonth()
+                for (start in 0 until cells step 7) {
+                    val week = row()
+                    for (cell in start until start + 7) {
+                        val dayNumber = cell - offset + 1
+                        val date = if (dayNumber in 1..month.lengthOfMonth()) month.atDay(dayNumber) else null
+                        val view = if (date == null) View(this@MainActivity) else label(number(dayNumber.toLong()),
+                            15, if (date == day) palette.onBrand else if (date > today) palette.muted else palette.ink).apply {
+                            gravity = Gravity.CENTER
+                            background = pressable(if (date == day) palette.brand else Color.TRANSPARENT, palette.ink, 12)
+                            contentDescription = date.format(fullDate)
+                            isSelected = date == day
+                            isEnabled = date <= today
+                            if (isEnabled) {
+                                isFocusable = true
+                                setOnClickListener {
+                                    dialog.dismiss()
+                                    selectDate(date)
+                                }
+                            }
+                        }
+                        week.addView(view, lp(0, dp(48), 1f))
+                    }
+                    block(calendar, week, 0)
+                }
+            }
+            drawMonth()
+            addButton(this, "Cancel", filled = false, top = 12) { dialog.dismiss() }
+        }
+    }
+
     private fun bandPage(page: LinearLayout) {
         val state = band.state
         val current = state.connecting ?: state.device
@@ -1123,12 +1289,12 @@ class MainActivity : ComponentActivity() {
         if (phoneCameraAvailable()) actionRow(tools, "Camera remote", Glyph.CAMERA, true, action = ::openCamera)
         if (connected) {
             actionRow(tools, "Find band", Glyph.SCAN, idle) { band.findBand() }
-            spotCheck(tools, state)
         }
+        actionRow(tools, "Phone vibration", Glyph.PHONE, true) { go(Tab.VIBRATION) }
         if (state.device != null || app.callAlertsRunning) {
-            actionRow(tools, if (app.callAlertsRunning) "Turn off call alerts" else "Turn on call alerts",
+            actionRow(tools, if (app.callAlertsRunning) "Turn off band call alerts" else "Turn on band call alerts",
                 Glyph.PHONE, true) { toggleCallAlerts() }
-            if (connected) actionRow(tools, "Test call alert", Glyph.PHONE, idle) { band.testCallAlert() }
+            if (connected) actionRow(tools, "Test band call alert", Glyph.PHONE, idle) { band.testCallAlert() }
             app.callAlertsIssue?.let { note(tools, it, 7, true) }
         }
         block(page, tools, 9)
@@ -1138,10 +1304,17 @@ class MainActivity : ComponentActivity() {
             val actions = panel()
             actionRow(actions, "Sync past 7 days", Glyph.CALENDAR, idle) { band.importHistory(true) }
             actionRow(actions, "Set band clock", Glyph.CLOCK, idle) { band.setClock() }
-            actionRow(actions, "Heart-rate logging", Glyph.PULSE, idle) {
-                AlertDialog.Builder(this).setTitle("Heart-rate logging")
-                    .setItems(arrayOf("Record every 5 minutes", "Pause logging")) { _, which -> band.setLogging(which == 0) }
-                    .setNegativeButton("Cancel", null).show()
+            val logging = state.automaticHeartLogging
+            val loggingMode = when (logging) {
+                true -> "Every 5 minutes"
+                false -> "On demand"
+                null -> if (idle) "Couldn’t confirm. Tap to retry." else null
+            }
+            actionRow(actions, "Heart-rate logging", Glyph.PULSE, idle, loggingMode) {
+                showChoices("Heart-rate logging", listOf(
+                    Choice("On demand", Glyph.PULSE, logging == false),
+                    Choice("Every 5 minutes", Glyph.CLOCK, logging == true)
+                )) { band.setLogging(it == 1) }
             }
             if (state.detailSyncAvailable) {
                 val title = when {
@@ -1170,13 +1343,14 @@ class MainActivity : ComponentActivity() {
             }
             if (state.device != null && !state.scanning) {
                 addButton(page, "Forget band", filled = false, top = 18) {
-                    AlertDialog.Builder(this).setTitle("Forget this band?")
-                        .setMessage("Readings stay on this phone.")
-                        .setNegativeButton("Cancel", null)
-                        .setPositiveButton("Forget") { _, _ ->
-                            stopService(Intent(this, CallRelayService::class.java))
+                    showPopup("Forget this band?") { dialog ->
+                        note(this, "Readings stay on this phone.", 2)
+                        popupActions(this, dialog, "Forget") {
+                            dialog.dismiss()
+                            stopService(Intent(this@MainActivity, CallRelayService::class.java))
                             band.forget()
-                        }.show()
+                        }
+                    }
                 }
             }
         }
@@ -1186,26 +1360,61 @@ class MainActivity : ComponentActivity() {
         block(page, data, 9)
     }
 
-    private fun spotCheck(tools: LinearLayout, state: BandState) {
-        val measuring = state.action == BandAction.MEASURING
-        actionRow(tools, if (measuring) "Stop measurement" else "Spot check", Glyph.PULSE,
-            measuring || state.action == BandAction.IDLE) {
-            if (measuring) band.stopMeasurement() else {
-                val metrics = HEALTH_METRICS.filter { it.liveType != null }
-                AlertDialog.Builder(this).setTitle("Spot check")
-                    .setItems(metrics.map { it.title }.toTypedArray()) { _, index -> band.measure(metrics[index]) }
-                    .setNegativeButton("Cancel", null).show()
+    private fun vibrationPage(page: LinearLayout) {
+        val vibration = app.phoneVibration
+        if (!vibration.available) {
+            note(page, "This phone has no vibrator.", 12)
+            return
+        }
+        if (packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)) {
+            val calls = panel()
+            vibrationSwitch(calls, "Incoming calls", vibration.callsEnabled) { enabled ->
+                if (enabled && !vibration.phoneAccess) {
+                    vibrationCallPermission.launch(Manifest.permission.READ_PHONE_STATE)
+                } else vibration.setCalls(enabled)
             }
+            block(page, calls, 12)
         }
-        val metric = state.measurement ?: return
-        val value = state.liveValue?.toLong()
-        if (measuring) note(tools, value?.let { "${metric.title} · ${displayValue(metric, it)}" } ?: "Keep your wrist still.", 3)
-        else if (value != null && state.measurementAt != null) {
-            val date = state.measurementAt.atZone(band.zone).toLocalDate()
-            divider(tools)
-            tools.addView(summaryRow(metric, value) { openHistory(metric, date) }, lp(-1, -2))
+        heading(page, "Apps", 22)
+        val apps = panel()
+        if (!vibration.notificationAccess) {
+            note(apps, "Allow notification access to choose apps.", 5)
+            addButton(apps, "Allow notification access", top = 10) {
+                startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            }
+        } else {
+            val launchable = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val names = packageManager.queryIntentActivities(launchable, 0)
+                .asSequence().map { it.activityInfo.applicationInfo }.distinctBy { it.packageName }
+                .filter { it.packageName != packageName }.map {
+                    it.packageName to it.loadLabel(packageManager).toString()
+                }.toList().sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.second })
+            val selected = vibration.apps
+            for ((id, name) in names) {
+                if (apps.isNotEmpty()) divider(apps)
+                vibrationSwitch(apps, name, id in selected) { vibration.setApp(id, it) }
+            }
+            if (names.isEmpty()) note(apps, "No apps to show.", 5)
         }
-        state.measurementMessage?.let { note(tools, it, 3, true) }
+        block(page, apps, 9)
+    }
+
+    private fun vibrationSwitch(parent: LinearLayout, title: String, checked: Boolean, change: (Boolean) -> Unit) {
+        block(parent, Switch(this).apply {
+            text = title
+            textSize = 16f
+            setTextColor(palette.ink)
+            minHeight = dp(52)
+            switchPadding = dp(12)
+            val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+            thumbTintList = ColorStateList(states, intArrayOf(palette.brand, palette.muted))
+            trackTintList = ColorStateList(states, intArrayOf(
+                ColorUtils.blendARGB(palette.surface, palette.brand, .48f),
+                ColorUtils.blendARGB(palette.surface, palette.muted, .56f)
+            ))
+            isChecked = checked
+            setOnCheckedChangeListener { _, enabled -> change(enabled) }
+        }, 0)
     }
 
     private fun toggleCallAlerts() {
@@ -1254,10 +1463,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun permissionSettings(title: String, message: String) {
-        AlertDialog.Builder(this).setTitle(title).setMessage(message)
-            .setPositiveButton("Open settings") { _, _ ->
-                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName")))
-            }.setNegativeButton("Cancel", null).show()
+        val appSettings = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:$packageName".toUri())
+        showPopup(title) { dialog ->
+            note(this, message, 2)
+            popupActions(this, dialog, "Open settings") {
+                dialog.dismiss()
+                startActivity(appSettings)
+            }
+        }
     }
 
     private fun cameraScreen() {
@@ -1335,27 +1548,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun detailsDialog(configured: Boolean) {
-        val fields = column().apply { setPadding(dp(22), dp(3), dp(22), 0) }
-        val username = EditText(this).apply {
-            hint = "QWatch username or email"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
-            setSingleLine()
-            isSaveEnabled = false
-        }
-        fields.addView(username, lp(-1, -2))
-        note(fields, "Use the QWatch username already linked to this band.", 6)
-        val builder = AlertDialog.Builder(this).setTitle("Sleep and oxygen sync").setView(fields)
-            .setNegativeButton("Cancel", null).setPositiveButton("Save & sync", null)
-        if (configured) builder.setNeutralButton("Remove username") { _, _ -> band.setDetailUsername(null) }
-        val dialog = builder.create()
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        showPopup("Sleep and oxygen sync") { dialog ->
+            val type = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+            val username = popupInput("QWatch username or email", type).apply { isSaveEnabled = false }
+            block(this, username, 2)
+            note(this, "Use the QWatch username linked to this band.", 8)
+            popupActions(this, dialog, "Save & sync") {
                 if (band.setDetailUsername(username.text.toString())) dialog.dismiss()
                 else username.error = if (band.state.action == BandAction.IDLE && band.state.detailSyncAvailable)
                     "Enter a valid QWatch username." else "Reconnect to the band and try again."
             }
+            if (configured) addButton(this, "Remove username", filled = false, top = 8) {
+                dialog.dismiss()
+                band.setDetailUsername(null)
+            }
         }
-        dialog.show()
     }
 
     private fun actionRow(parent: LinearLayout, title: String, glyph: Glyph, enabled: Boolean,
@@ -1416,36 +1623,25 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun backupDialog(endpoint: String?) {
-        val fields = column().apply { setPadding(dp(22), dp(3), dp(22), 0) }
-        val address = EditText(this).apply {
-            hint = "https://backup.example.com"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setSingleLine()
-            setText(endpoint.orEmpty())
-            contentDescription = "HTTPS server address"
-        }
-        val key = EditText(this).apply {
-            hint = "Backup key"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setSingleLine()
-            isSaveEnabled = false
-            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
-        }
-        fields.addView(address, lp(-1, -2))
-        fields.addView(key, lp(-1, -2).apply { topMargin = dp(8) })
-        if (endpoint != null) note(fields, "Leave the key blank to keep it for this server.", 9)
-        val error = label("", 13, palette.warning).apply { visibility = View.GONE }
-        block(fields, error, 6)
-        val builder = AlertDialog.Builder(this).setTitle("Home server").setView(fields)
-            .setNegativeButton("Cancel", null).setPositiveButton("Save & sync", null)
-        if (endpoint != null) builder.setNeutralButton("Turn off backup") { _, _ -> disableBackup() }
-        val dialog = builder.create()
-        dialog.setOnShowListener {
-            dialog.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        showPopup("Home server", secure = true) { dialog ->
+            val address = popupInput("https://backup.example.com", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+                .apply {
+                    setText(endpoint.orEmpty())
+                    contentDescription = "HTTPS server address"
+                }
+            val key = popupInput("Backup key", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+                .apply {
+                    isSaveEnabled = false
+                    importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                }
+            block(this, address, 2)
+            block(this, key, 8)
+            if (endpoint != null) note(this, "Leave the key blank to keep it for this server.", 9)
+            val error = label("", 13, palette.warning).apply { visibility = View.GONE }
+            block(this, error, 6)
+            popupActions(this, dialog, "Save & sync") { save ->
                 val host = address.text.toString()
                 val token = key.text.toString()
-                val save = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 save.isEnabled = false
                 app.databaseThread.execute {
                     val result = runCatching { app.settings.save(host, token) }
@@ -1455,7 +1651,7 @@ class MainActivity : ComponentActivity() {
                             key.text.clear()
                             dialog.dismiss()
                             backupRequestedAt = System.currentTimeMillis()
-                            backupMessage = if (BackupJob.schedule(this, immediate = true, replaceManual = true))
+                            backupMessage = if (BackupJob.schedule(this@MainActivity, immediate = true, replaceManual = true))
                                 "Sync requested." else "Couldn’t schedule sync. Try again."
                             loadData()
                         }.onFailure {
@@ -1466,8 +1662,11 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            if (endpoint != null) addButton(this, "Turn off backup", filled = false, top = 8) {
+                dialog.dismiss()
+                disableBackup()
+            }
         }
-        dialog.show()
     }
 
     private fun disableBackup() {
@@ -1483,6 +1682,96 @@ class MainActivity : ComponentActivity() {
                 }
                 loadData()
             }
+        }
+    }
+
+    private data class Choice(val title: String, val icon: Glyph, val selected: Boolean = false)
+
+    private fun showChoices(title: String, choices: List<Choice>, choose: (Int) -> Unit) {
+        showPopup(title) { dialog ->
+            choices.forEachIndexed { index, choice ->
+                val option = row().apply {
+                    minimumHeight = dp(52)
+                    setPadding(dp(9), dp(7), dp(11), dp(7))
+                    background = pressable(if (choice.selected) palette.tint else Color.TRANSPARENT, palette.brand, 13)
+                    isSelected = choice.selected
+                    isFocusable = true
+                    contentDescription = choice.title
+                    addView(iconBadge(choice.icon, palette.brand), lp(dp(32), dp(32)))
+                    addView(label(choice.title, 16, palette.ink, "sans-serif-medium").ignoreAccessibility(),
+                        lp(0, -2, 1f).apply { marginStart = dp(11) })
+                    if (choice.selected) addView(Icon(this@MainActivity, Glyph.CHECK, palette.brand),
+                        lp(dp(19), dp(19)))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        choose(index)
+                    }
+                }
+                block(this, option, if (index == 0) 0 else 3)
+            }
+            addButton(this, "Cancel", filled = false, top = 12) { dialog.dismiss() }
+        }
+    }
+
+    @Suppress("DEPRECATION") // Resize the floating window around the keyboard on older Android versions.
+    private fun showPopup(title: String, secure: Boolean = false, fill: LinearLayout.(Dialog) -> Unit) {
+        popup?.dismiss()
+        val dialog = Dialog(this)
+        popup = dialog
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val body = column().apply {
+            isFocusableInTouchMode = true
+            setPadding(dp(18), dp(19), dp(18), dp(15))
+            block(this, label(title, 23, palette.ink, "sans-serif-medium").apply {
+                if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+            }, 0)
+            block(this, View(this@MainActivity).apply { setBackgroundColor(palette.border) }, 13, dp(1))
+            val fields = column()
+            fields.fill(dialog)
+            block(this, fields, 11)
+        }
+        dialog.setContentView(ScrollView(this).apply {
+            background = shape(palette.surface, 26, palette.border)
+            clipToOutline = true
+            isVerticalScrollBarEnabled = false
+            addView(body, FrameLayout.LayoutParams(-1, -2))
+        })
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnDismissListener { if (popup === dialog) popup = null }
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            setDimAmount(if (palette.night) .64f else .32f)
+            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+            if (secure) addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        body.requestFocus()
+        dialog.show()
+        dialog.window?.setLayout(dp((resources.configuration.screenWidthDp - 24).coerceIn(1, 430)), -2)
+    }
+
+    private fun popupActions(parent: LinearLayout, dialog: Dialog, title: String, confirm: (Button) -> Unit) {
+        val actions = row()
+        actions.addView(button("Cancel", filled = false) { dialog.dismiss() }, lp(0, -2, 1f))
+        val save = button(title, filled = true) {}
+        save.setOnClickListener { confirm(save) }
+        actions.addView(save, lp(0, -2, 1f).apply { marginStart = dp(8) })
+        block(parent, actions, 15)
+    }
+
+    private fun popupInput(name: String, type: Int) = EditText(this).apply {
+        id = View.generateViewId()
+        inputType = type
+        hint = name
+        setSingleLine()
+        minHeight = dp(48)
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        setTextColor(palette.ink)
+        setHintTextColor(palette.muted)
+        background = android.graphics.drawable.StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_focused), shape(palette.background, 12, palette.brand))
+            addState(intArrayOf(), shape(palette.background, 12, palette.border))
         }
     }
 
@@ -1518,16 +1807,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun readout(value: String, unit: String = "", size: Int = 43): TextView {
-        val text = if (unit.isEmpty()) value else if (unit == "%") "$value%" else "$value $unit"
-        return label(text, size, palette.ink, "sans-serif-medium").apply {
+    private fun readout(value: String, unit: String = "", size: Int = 43): TextView =
+        label(value, size, palette.ink, "sans-serif-medium").apply {
             letterSpacing = -.038f
-            if (unit.isNotEmpty()) {
-                val styled = android.text.SpannableString(text)
-                styled.setSpan(android.text.style.RelativeSizeSpan(.44f), value.length, text.length, 0)
-                styled.setSpan(android.text.style.ForegroundColorSpan(palette.muted), value.length, text.length, 0)
-                this.text = styled
-            }
+            text = readoutText(value, unit)
+        }
+
+    private fun readoutText(value: String, unit: String): CharSequence {
+        if (unit.isEmpty()) return value
+        return android.text.SpannableString(if (unit == "%") "$value%" else "$value $unit").apply {
+            setSpan(android.text.style.RelativeSizeSpan(.44f), value.length, length, 0)
+            setSpan(android.text.style.ForegroundColorSpan(palette.muted), value.length, length, 0)
         }
     }
 
@@ -1614,10 +1904,14 @@ class MainActivity : ComponentActivity() {
         minWidth = 0
         gravity = Gravity.CENTER
         stateListAnimator = null
-        val bg = if (!enabled) palette.background else if (filled) palette.brand else palette.surface
-        val fg = if (!enabled) palette.muted else if (filled) palette.onBrand else palette.brand
-        background = pressable(bg, fg, 13, if (!filled || !enabled) palette.border else null)
-        setTextColor(fg)
+        val bg = if (filled) palette.brand else palette.surface
+        val fg = if (filled) palette.onBrand else palette.brand
+        val disabled = intArrayOf(-android.R.attr.state_enabled)
+        background = android.graphics.drawable.StateListDrawable().apply {
+            addState(disabled, shape(palette.background, 13, palette.border))
+            addState(intArrayOf(), pressable(bg, fg, 13, if (filled) null else palette.border))
+        }
+        setTextColor(ColorStateList(arrayOf(disabled, intArrayOf()), intArrayOf(palette.muted, fg)))
         setPadding(dp(12), dp(8), dp(12), dp(8))
         isEnabled = enabled
         setOnClickListener { action() }

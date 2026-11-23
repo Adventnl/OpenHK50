@@ -38,12 +38,14 @@ On Windows use `gradlew.bat`; keep the Rust tools on `PATH`. The APK supports An
 ## Use the band
 
 1. On the Android phone, open **Band → Scan for bands**, allow nearby device access, and select your band, for example **HK50_3806**. Disconnect it in QWatch Pro or nRF Connect before scanning if either app is using it.
-2. Open **Today** for steps, band calories, workout time, distance, yesterday’s steps, and last night’s sleep. Tap **Goals** to set daily targets. Use the calendar or tap a metric to open Day, Week, or Year history. **Health** shows heart rate, oxygen, HRV, stress, and available sleep stages.
+2. Open **Today** for steps, band calories, workout time, distance, yesterday’s steps, and last night’s sleep. Steps open in Day history. **Average sleep** opens the previous seven complete days. Tap **Goals** to set daily targets.
 3. Open **Workouts**, tap **Start workout**, and choose an activity. Use **Pause**, **Resume**, or **End workout**. The session survives app restarts. Saved sessions show active duration and average heart rate when the band supplies readings during the workout. A configured personal build shows estimated active calories during and after Strength sessions.
-4. **Band → Sync now** fetches today. **Sync past 7 days** requests recent history. HK50 devices with the detail channel try sleep and oxygen sync directly. For H59 or firmware that requires sign-in, enter the linked QWatch username under Band settings. The app stores the username on the phone and sends it over BLE.
-5. Under **Band → Tools**, use **Find band**, **Spot check**, or **Phone clock**. **Camera remote** takes a photo when you move your wrist with the band connected or tap **Take photo**. It offers a three-second timer and front or rear camera selection when available. Photos save to `Pictures/OpenHK50` on Android 10 or later and to app storage on Android 8–9. **Turn on call alerts** relays incoming cellular calls while the band service is running.
+4. To check your pulse, open **Health → Measure → Heart rate**. Keep your wrist still and watch for a live BPM reading. Tap **Stop measurement** to end it early. Automatic heart-rate logging defaults to **On demand** and can be enabled under **Band → Heart-rate logging**.
+5. **Band → Sync now** fetches today and checks for yesterday’s activity. **Sync past 7 days** requests recent history. HK50 devices with the detail channel try sleep and oxygen sync directly. For H59 or firmware that requires sign-in, enter the linked QWatch username under Band settings. The app stores the username on the phone and sends it over BLE.
+6. Open **Band → Phone vibration**. Grant notification access and switch on the apps you want to buzz. The app uses the package name for matching. **Incoming calls** uses phone access and repeats the buzz while a cellular call rings.
+7. **Band → Tools** includes **Find band** and **Phone clock**. **Camera remote** takes a photo when you move your wrist with the band connected or tap **Take photo**. It offers a three-second timer and front or rear camera selection when available. Photos save to `Pictures/OpenHK50` on Android 10 or later and to app storage on Android 8–9. **Turn on band call alerts** relays incoming cellular calls while the band service is running.
 
-The band reconnects and syncs while the app is open or call alerts are running. Pair in the time zone used by the band clock. **Set band clock** and **Heart-rate logging** are manual controls.
+The band reconnects and syncs while the app is open or band call alerts are running. Pair in the time zone used by the band clock.
 
 ### Personal Strength estimates
 

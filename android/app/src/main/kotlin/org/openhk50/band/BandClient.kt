@@ -42,8 +42,9 @@ data class BandState(
     val charging: Boolean = false,
     val measurement: Metric? = null,
     val liveValue: Int? = null,
-    val measurementAt: Instant? = null,
+    val measurementStopping: Boolean = false,
     val measurementMessage: String? = null,
+    val automaticHeartLogging: Boolean? = null,
     val lastSync: Long? = null,
     val detailSyncAvailable: Boolean = false,
     val detailSyncEnabled: Boolean = false,
@@ -85,6 +86,7 @@ internal class BandClient(
     private var callAlertSent = false
     private var historyReceived = false
     private var stepsReceived = false
+    private var lastSyncedYesterday: LocalDate? = null
     private val unavailableHistory = mutableSetOf<Int>()
     private var bandZone = ZoneId.of(prefs.getString("zone", null) ?: ZoneId.systemDefault().id)
     val zone: ZoneId get() = if (state.device == null) ZoneId.systemDefault() else bandZone
@@ -187,7 +189,7 @@ internal class BandClient(
         cameraClosing = false
         closeAfterCamera = false
         publish(state.copy(connection = Connection.DISCONNECTED, connecting = null, action = BandAction.IDLE,
-            battery = null, charging = false, liveValue = null, detailSyncAvailable = false,
+            battery = null, charging = false, liveValue = null, measurementStopping = false, detailSyncAvailable = false,
             cameraActive = false, cameraIssue = null, message = message))
     }
 
@@ -200,7 +202,7 @@ internal class BandClient(
     fun forget() {
         if (state.connection != Connection.DISCONNECTED) return
         val editor = prefs.edit().remove("address").remove("name").remove("zone").remove("autoReconnect")
-        state.device?.let { editor.remove(detailKey(it)) }
+        state.device?.let { editor.remove(detailKey(it)).remove(loggingKey(it)) }
         editor.apply()
         autoReconnect = true
         publish(state.copy(device = null, lastSync = null, measurement = null, measurementMessage = null,
@@ -227,7 +229,10 @@ internal class BandClient(
     override fun connected(detailSyncAvailable: Boolean) {
         val device = state.connecting ?: return
         val sameBand = state.device?.address == device.address
-        if (!sameBand) bandZone = ZoneId.systemDefault()
+        if (!sameBand) {
+            bandZone = ZoneId.systemDefault()
+            lastSyncedYesterday = null
+        }
         autoReconnect = true
         retryConnection = true
         prefs.edit().putString("address", device.address).putString("name", device.name)
@@ -238,6 +243,21 @@ internal class BandClient(
             detailSyncEnabled = detailSyncAvailable && (usernameSet || device.canReadDetailsDirectly()),
             detailUsernameSet = usernameSet, message = null)
         sendCallAlert()
+        publish(state.copy(action = BandAction.SETTING, automaticHeartLogging = null))
+        val logging = prefs.getBoolean(loggingKey(device), false)
+        request(NativeProtocol.packet(HEART_LOG, 1), 1_500) { result ->
+            val current = result.frames.firstOrNull()?.get(2)?.toInt()
+            if (current == if (logging) 1 else 2) {
+                state = state.copy(automaticHeartLogging = logging)
+                beginConnectedSync()
+            } else {
+                writeLogging(logging, ::beginConnectedSync)
+            }
+        }
+    }
+
+    private fun beginConnectedSync() {
+        state = state.copy(action = BandAction.IDLE)
         importHistory(false)
     }
 
@@ -269,16 +289,13 @@ internal class BandClient(
 
     private fun importDay(device: BandDevice, today: LocalDate, offset: Int) {
         if (offset >= state.days) {
-            if (historyReceived || stepsReceived) state = state.copy(lastSync = System.currentTimeMillis())
-            val message = when {
-                historyReceived && stepsReceived -> null
-                historyReceived -> "Step history didn’t reply. Sync again."
-                stepsReceived -> "Heart-rate history didn’t reply. Sync again."
-                else -> "No history reply. Sync again."
-            }
-            val username = prefs.getString(detailKey(device), null)
-            if (state.detailSyncEnabled) startDetails(device, username, today, state.days, message)
-            else finish(message)
+            val yesterday = today.minusDays(1)
+            if (state.days == 1 && lastSyncedYesterday != yesterday) {
+                importActivity(device, today, 1) { received ->
+                    if (received) lastSyncedYesterday = yesterday
+                    finishImport(device, today)
+                }
+            } else finishImport(device, today)
             return
         }
         publish(state.copy(progress = offset + 1))
@@ -289,28 +306,50 @@ internal class BandClient(
                 writeIntervals(device, Metric.HEART, day, NativeProtocol.heartIntervals(heart.frames))
             }
             if (!sameDay(today)) return@request
-            request(NativeProtocol.stepRequest(offset), 3_500) stepsRequest@{ steps ->
-                if (!sameDay(today)) return@stepsRequest
-                if (!steps.rejected && steps.frames.isNotEmpty()) {
-                    val intervals = NativeProtocol.activityIntervals(steps.frames, day)
-                    stepsReceived = stepsReceived || intervals.isNotEmpty() ||
-                        steps.frames.any { (it[1].toInt() and 255) == 255 }
-                    val observed = System.currentTimeMillis()
-                    val readings = buildList {
-                        for (slot in intervals) {
-                            addInterval(device, Metric.STEPS, day, slot.minute, slot.steps, observed)
-                            addInterval(device, Metric.CALORIES, day, slot.minute, slot.calories, observed)
-                            addInterval(device, Metric.DISTANCE, day, slot.minute, slot.distance, observed)
-                        }
-                    }
-                    if (readings.isNotEmpty()) save(readings)
-                }
+            importActivity(device, today, offset) { received ->
+                stepsReceived = stepsReceived || received
+                if (offset == 1 && received) lastSyncedYesterday = day
                 importSlots(device, today, offset, STRESS_HISTORY, Metric.STRESS) {
                     importSlots(device, today, offset, HRV_HISTORY, Metric.HRV) {
                         importDay(device, today, offset + 1)
                     }
                 }
             }
+        }
+    }
+
+    private fun finishImport(device: BandDevice, today: LocalDate) {
+        if (historyReceived || stepsReceived) state = state.copy(lastSync = System.currentTimeMillis())
+        val message = when {
+            historyReceived && stepsReceived -> null
+            historyReceived -> "Step history didn’t reply. Sync again."
+            stepsReceived -> "Heart-rate history didn’t reply. Sync again."
+            else -> "No history reply. Sync again."
+        }
+        val username = prefs.getString(detailKey(device), null)
+        if (state.detailSyncEnabled) startDetails(device, username, today, state.days, message)
+        else finish(message)
+    }
+
+    private fun importActivity(device: BandDevice, today: LocalDate, offset: Int, done: (Boolean) -> Unit) {
+        val day = today.minusDays(offset.toLong())
+        request(NativeProtocol.stepRequest(offset), 3_500) { steps ->
+            if (!sameDay(today)) return@request
+            if (steps.rejected || steps.frames.isEmpty()) {
+                done(false)
+                return@request
+            }
+            val intervals = NativeProtocol.activityIntervals(steps.frames, day)
+            val observed = System.currentTimeMillis()
+            val readings = buildList {
+                for (slot in intervals) {
+                    addInterval(device, Metric.STEPS, day, slot.minute, slot.steps, observed)
+                    addInterval(device, Metric.CALORIES, day, slot.minute, slot.calories, observed)
+                    addInterval(device, Metric.DISTANCE, day, slot.minute, slot.distance, observed)
+                }
+            }
+            if (readings.isNotEmpty()) save(readings)
+            done(intervals.isNotEmpty() || steps.frames.any { (it[1].toInt() and 255) == 255 })
         }
     }
 
@@ -394,8 +433,8 @@ internal class BandClient(
         stopRequested = false
         closingAfterMeasurement = false
         publish(state.copy(action = BandAction.MEASURING, measurement = metric, liveValue = null,
-            measurementAt = null, measurementMessage = null))
-        request(NativeProtocol.packet(LIVE, type, 1), 30_000) { result ->
+            measurementStopping = false, measurementMessage = null))
+        request(NativeProtocol.packet(LIVE, type, 1), if (metric == Metric.HEART) 60_000 else 30_000) { result ->
             val message = when {
                 result.rejected && liveSamples.isEmpty() -> "The band couldn’t measure. Check the fit and try again."
                 liveSamples.isEmpty() -> "No reading. Wear the band snugly and hold still."
@@ -411,6 +450,7 @@ internal class BandClient(
         val metric = state.measurement ?: return
         val type = metric.liveType ?: return
         stopRequested = true
+        if (!state.measurementStopping) publish(state.copy(measurementStopping = true))
         if (current.written) {
             clearExchange()
             stopOnBand(metric, type, null)
@@ -418,6 +458,7 @@ internal class BandClient(
     }
 
     private fun stopOnBand(metric: Metric, type: Int, message: String?) {
+        if (!state.measurementStopping) publish(state.copy(measurementStopping = true))
         val device = state.device
         val reading = if (device != null && liveSamples.isNotEmpty()) {
             liveSamples.sort()
@@ -425,23 +466,38 @@ internal class BandClient(
             liveSamples.clear()
             Reading.live(device.address, metric, median, Instant.now()).also { save(listOf(it)) }
         } else null
-        request(NativeProtocol.packet(LIVE_STOP, type, 0, 0), 500) {
+        request(NativeProtocol.packet(LIVE_STOP, type, 0, 0), 500) { result ->
             if (!connectionNeeded || closingAfterMeasurement) {
                 val reopen = reopenAfterMeasurement
                 closeLink(null)
                 if (reopen) autoConnect()
             } else {
-                state = state.copy(liveValue = reading?.value, measurementAt = reading?.time?.let(Instant::ofEpochMilli),
-                    measurementMessage = message)
+                state = state.copy(liveValue = reading?.value, measurementStopping = false,
+                    measurementMessage = if (result.rejected) "The band rejected Stop. Reconnect and try again." else message)
                 finish(state.message)
             }
         }
     }
 
-    fun setLogging(enabled: Boolean) = setting(
-        NativeProtocol.packet(HEART_LOG, 2, if (enabled) 1 else 2, 5),
-        "logging change", if (enabled) "Band accepted the logging request." else "Band accepted the pause request."
-    )
+    private fun loggingKey(device: BandDevice) = "heartLogging.${device.address}"
+
+    fun setLogging(enabled: Boolean) {
+        val device = availableDevice() ?: return
+        prefs.edit().putBoolean(loggingKey(device), enabled).apply()
+        if (state.automaticHeartLogging == enabled) return
+        main.removeCallbacks(refresh)
+        publish(state.copy(action = BandAction.SETTING, message = null))
+        writeLogging(enabled) {
+            finish(if (state.automaticHeartLogging == null) "Couldn’t confirm heart-rate logging. Try again." else null)
+        }
+    }
+
+    private fun writeLogging(enabled: Boolean, done: () -> Unit) {
+        request(NativeProtocol.packet(HEART_LOG, 2, if (enabled) 1 else 2, 5), 1_500) { result ->
+            state = state.copy(automaticHeartLogging = enabled.takeIf { !result.rejected && result.frames.isNotEmpty() })
+            done()
+        }
+    }
 
     fun setClock() {
         val now = ZonedDateTime.now(zone)
@@ -585,7 +641,7 @@ internal class BandClient(
                     } else if (value in metric.intervalValues) {
                         liveSamples += value
                         publish(state.copy(liveValue = value))
-                        current.terminal = liveSamples.size >= 6
+                        current.terminal = metric != Metric.HEART && liveSamples.size >= 6
                     }
                 }
                 else -> {
