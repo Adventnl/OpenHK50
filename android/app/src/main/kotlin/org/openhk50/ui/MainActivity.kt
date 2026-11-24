@@ -52,6 +52,7 @@ import org.openhk50.band.Connection
 import org.openhk50.data.HealthStore
 import org.openhk50.data.Metric
 import org.openhk50.data.DAY_BUCKET_HOURS
+import org.openhk50.data.DailyEnergy
 import org.openhk50.data.HistoryPeriod
 import org.openhk50.data.SleepNight
 import org.openhk50.data.SleepStage
@@ -60,6 +61,7 @@ import org.openhk50.data.WorkoutEnergyProfile
 import org.openhk50.data.WorkoutLog
 import org.openhk50.data.WorkoutType
 import org.openhk50.data.combined
+import org.openhk50.data.dayBoundaries
 import org.openhk50.sync.BackupJob
 import java.text.NumberFormat
 import java.time.Instant
@@ -72,14 +74,17 @@ import java.time.format.FormatStyle
 import java.time.format.TextStyle
 import java.time.temporal.WeekFields
 import java.util.Locale
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private enum class Tab(val title: String, val icon: Glyph, val inNavigation: Boolean = true) {
         TODAY("Today", Glyph.TODAY), ACTIVITY("Workouts", Glyph.WALK), HEALTH("Health", Glyph.PULSE),
         BAND("Band", Glyph.BAND), HISTORY("History", Glyph.CALENDAR, false),
+        DAILY_ACTIVITY("Daily activity", Glyph.TODAY, false),
         WORKOUT_TYPES("Choose workout", Glyph.WALK, false), BACKUP("Backup", Glyph.BACKUP, false),
         CAMERA("Camera remote", Glyph.CAMERA, false), CLOCK("Phone clock", Glyph.CLOCK, false),
-        MEASURE("Measure", Glyph.PULSE, false), VIBRATION("Phone vibration", Glyph.PHONE, false)
+        MEASURE("Measure", Glyph.PULSE, false), VIBRATION("Phone vibration", Glyph.PHONE, false),
+        PRIVACY("Privacy", Glyph.CHECK, false)
     }
     private enum class PermissionAction { SCAN, RECONNECT }
     private enum class Goal(val title: String, val unit: String, val target: Int, val max: Int, val metric: Metric?) {
@@ -96,12 +101,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var navigation: LinearLayout
     private var scroll: ScrollView? = null
     private var todayDial: ActivityDial? = null
+    private var dailyDial: ActivityDial? = null
     private var tab = Tab.TODAY
     private var detailParent = Tab.TODAY
     private var historyMetric: Metric? = Metric.HEART
     private var historyDate = LocalDate.now()
     private var historyPeriod = HistoryPeriod.DAY
     private var currentDay: HealthStore.Day? = null
+    private var activityDate: LocalDate? = null
+    private var activityMinutes: List<Long>? = null
+    private var updateEnergy: (() -> Unit)? = null
     private var trend: HealthStore.Trend? = null
     private var summary: SummaryData? = null
     private var workouts: WorkoutLog? = null
@@ -130,10 +139,13 @@ class MainActivity : ComponentActivity() {
         override fun run() {
             if (tab in DAILY_TABS && lastShownDate != LocalDate.now(band.zone)) {
                 currentDay = null
+                activityMinutes = null
+                dailyDial = null
                 summary = null
                 drawScreen(keepScroll = true)
                 loadData()
             }
+            updateEnergy?.invoke()
             app.main.postDelayed(this, 30_000)
         }
     }
@@ -193,6 +205,7 @@ class MainActivity : ComponentActivity() {
             tab = Tab.BAND
         }
         historyDate = savedInstanceState?.getString("day")?.let(LocalDate::parse) ?: LocalDate.now(band.zone)
+        activityDate = savedInstanceState?.getString("activityDate")?.let(LocalDate::parse)
         historyPeriod = savedInstanceState?.getString("period")?.let(HistoryPeriod::valueOf) ?: HistoryPeriod.DAY
         workoutPage = savedInstanceState?.getInt("workoutPage") ?: 0
         measureMetric = savedInstanceState?.getString("measureMetric")?.let(Metric::valueOf) ?: Metric.HEART
@@ -222,12 +235,15 @@ class MainActivity : ComponentActivity() {
             if (lastDevice != device) {
                 lastDevice = device
                 currentDay = null
+                activityMinutes = null
+                dailyDial = null
                 trend = null
                 summary = null
                 loadData()
             }
             if (tab in DAILY_TABS && lastShownDate != LocalDate.now(band.zone)) {
                 currentDay = null
+                activityMinutes = null
                 summary = null
                 loadData()
             }
@@ -248,7 +264,8 @@ class MainActivity : ComponentActivity() {
         resumed = true
         if (tab == Tab.CAMERA && !phoneCameraAvailable()) go(Tab.BAND)
         else camera?.resume(true)
-        if (tab == Tab.VIBRATION) drawScreen(keepScroll = true)
+        if (tab == Tab.VIBRATION || tab == Tab.PRIVACY) drawScreen(keepScroll = true)
+        updateEnergy?.invoke()
     }
 
     override fun onPause() {
@@ -279,6 +296,7 @@ class MainActivity : ComponentActivity() {
         outState.putString("tab", tab.name)
         outState.putString("detailParent", detailParent.name)
         outState.putString("day", historyDate.toString())
+        outState.putString("activityDate", activityDate?.toString())
         outState.putString("period", historyPeriod.name)
         outState.putInt("workoutPage", workoutPage)
         outState.putString("measureMetric", measureMetric.name)
@@ -418,9 +436,11 @@ class MainActivity : ComponentActivity() {
         queryGeneration++
         backupMessage = null
         if (next == Tab.HISTORY || next in DAILY_TABS) currentDay = null
+        if (next == Tab.DAILY_ACTIVITY) activityMinutes = null
         if (next == Tab.TODAY) summary = null
         if (next == Tab.HISTORY) trend = null
         if (next != Tab.TODAY) todayDial = null
+        if (next != Tab.DAILY_ACTIVITY) dailyDial = null
         drawNavigation(previousSection)
         updateBack()
         drawScreen()
@@ -445,8 +465,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun backDestination() = when (tab) {
-        Tab.BACKUP, Tab.CAMERA, Tab.CLOCK, Tab.VIBRATION -> Tab.BAND
+        Tab.BACKUP, Tab.CAMERA, Tab.CLOCK, Tab.VIBRATION, Tab.PRIVACY -> Tab.BAND
         Tab.MEASURE -> Tab.HEALTH
+        Tab.DAILY_ACTIVITY -> Tab.TODAY
         Tab.HISTORY, Tab.WORKOUT_TYPES -> detailParent
         else -> Tab.TODAY
     }
@@ -471,7 +492,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadData() {
-        if (!active || tab in setOf(Tab.BAND, Tab.CAMERA, Tab.CLOCK, Tab.WORKOUT_TYPES, Tab.MEASURE, Tab.VIBRATION)) return
+        if (!active || tab in setOf(Tab.BAND, Tab.CAMERA, Tab.CLOCK, Tab.WORKOUT_TYPES, Tab.MEASURE, Tab.VIBRATION, Tab.PRIVACY)) return
         val generation = ++queryGeneration
         val address = band.state.device?.address
         val zone = band.zone
@@ -481,7 +502,11 @@ class MainActivity : ComponentActivity() {
         val metric = historyMetric
         val page = workoutPage
         val today = LocalDate.now(zone)
-        val date = if (history) period.endDate(historyDate, today) else today
+        val date = when (destination) {
+            Tab.HISTORY -> period.endDate(historyDate, today)
+            Tab.DAILY_ACTIVITY -> selectedActivityDate(today)
+            else -> today
+        }
         app.databaseThread.execute {
             val result = runCatching {
                 DataSnapshot(
@@ -500,13 +525,17 @@ class MainActivity : ComponentActivity() {
                         else -> null
                     },
                     pending = if (destination == Tab.BACKUP) app.health.pendingCount() else 0L,
-                    summary = if (destination == Tab.TODAY) loadSummary(address, date, zone) else null
+                    summary = if (destination == Tab.TODAY) loadSummary(address, date, zone) else null,
+                    activityMinutes = if (destination == Tab.DAILY_ACTIVITY) {
+                        app.health.workoutMinuteBuckets(dayBoundaries(date, zone))
+                    } else null
                 )
             }
             app.main.post {
                 if (active && generation == queryGeneration) {
-                    result.onSuccess { (day, series, log, count, overview) ->
+                    result.onSuccess { (day, series, log, count, overview, minutes) ->
                         currentDay = day
+                        activityMinutes = minutes
                         trend = series
                         if (log != null) workouts = log
                         pendingCount = count
@@ -521,7 +550,7 @@ class MainActivity : ComponentActivity() {
 
     private data class DataSnapshot(
         val day: HealthStore.Day?, val trend: HealthStore.Trend?,
-        val workouts: WorkoutLog?, val pending: Long, val summary: SummaryData?
+        val workouts: WorkoutLog?, val pending: Long, val summary: SummaryData?, val activityMinutes: List<Long>?
     )
 
     private data class SummaryData(
@@ -541,6 +570,7 @@ class MainActivity : ComponentActivity() {
         app.main.removeCallbacks(tickWorkout)
         workoutTimer = null
         workoutCalories = null
+        updateEnergy = null
         renderMeasurement = null
         if (tab == Tab.CAMERA) {
             scroll = null
@@ -567,9 +597,10 @@ class MainActivity : ComponentActivity() {
         updateScrollInsets()
         content.removeAllViews()
         content.addView(viewport, FrameLayout.LayoutParams(-1, -1))
-        if (!tab.inNavigation) pageHeader(page)
+        if (!tab.inNavigation && tab != Tab.DAILY_ACTIVITY) pageHeader(page)
         when (tab) {
             Tab.TODAY -> today(page)
+            Tab.DAILY_ACTIVITY -> dailyActivity(page)
             Tab.HEALTH -> health(page)
             Tab.ACTIVITY -> activity(page)
             Tab.HISTORY -> history(page)
@@ -578,6 +609,7 @@ class MainActivity : ComponentActivity() {
             Tab.WORKOUT_TYPES -> workoutTypes(page)
             Tab.MEASURE -> measurementPage(page)
             Tab.VIBRATION -> vibrationPage(page)
+            Tab.PRIVACY -> privacyPage(page)
             Tab.CAMERA, Tab.CLOCK -> Unit
         }
         if (previous > 0) viewport.post { viewport.scrollTo(0, previous) }
@@ -587,12 +619,9 @@ class MainActivity : ComponentActivity() {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
         val day = currentDay
-        val calendar = iconButton(Glyph.CALENDAR, "Activity history", true) {
-            openHistory(Metric.STEPS, today)
-        }
         showReadIssues(page)
-        sectionHeader(page, "Activity", "Goals", 0, trailing = calendar, display = true, open = ::editGoals)
-        val activity = panel(radius = 26).apply { background = accentSurface(palette, palette.workout, 26) }
+        sectionHeader(page, "Activity", "Goals", 0, open = ::editGoals)
+        val activity = panel(radius = 22)
         val values = listOf(day?.value(Metric.CALORIES), summary?.workoutMinutes, day?.value(Metric.STEPS))
         val goals = Goal.entries.mapIndexed { index, goal ->
             GoalProgress(values[index], displayPrefs.getInt(goal.name, goal.target), goalColor(goal))
@@ -621,7 +650,7 @@ class MainActivity : ComponentActivity() {
                     lp(0, -2, 1f).apply { marginStart = dp(6) })
                 addView(legend, lp(-1, -2))
                 val suffix = if (goal == Goal.STEPS) " / $target" else " / $target ${goal.unit}"
-                addView(label(value + suffix, 25, reading.color, "sans-serif-medium").apply {
+                addView(label(value + suffix, 25, palette.ink, "sans-serif-medium").apply {
                     letterSpacing = -.025f
                     val styled = android.text.SpannableString(text)
                     styled.setSpan(android.text.style.RelativeSizeSpan(.57f), value.length, text.length, 0)
@@ -650,6 +679,11 @@ class MainActivity : ComponentActivity() {
         activity.addView(summaryRow(Metric.DISTANCE, day?.value(Metric.DISTANCE)) {
             openHistory(Metric.DISTANCE, today)
         }, lp(-1, -2))
+        divider(activity)
+        activity.addView(summaryRow("Daily activity", Glyph.CALENDAR, null, showMissing = false) {
+            activityDate = null
+            go(Tab.DAILY_ACTIVITY)
+        }, lp(-1, -2))
         block(page, activity, 8)
 
         val snapshots = if (stack) column() else row().apply { gravity = Gravity.TOP }
@@ -668,7 +702,7 @@ class MainActivity : ComponentActivity() {
         }
         block(page, snapshots, 10)
 
-        sectionHeader(page, "Workouts", "View all", 17) { go(Tab.ACTIVITY) }
+        heading(page, "Workouts", 17)
         val log = workouts
         val activeWorkout = log?.active
         when {
@@ -682,9 +716,7 @@ class MainActivity : ComponentActivity() {
             else -> workoutRecords(page, log.recent)
         }
 
-        sectionHeader(page, "7-day trends", "History", 17) {
-            openHistory(Metric.STEPS, today.minusDays(1))
-        }
+        heading(page, "7-day trends", 17)
         val trends = panel()
         trends.addView(summaryRow("Average daily steps", Glyph.STEPS, summary?.averageSteps?.let(::number)) {
             openHistory(Metric.STEPS, today.minusDays(1))
@@ -694,6 +726,255 @@ class MainActivity : ComponentActivity() {
             openHistory(null, today.minusDays(1), HistoryPeriod.WEEK)
         }, lp(-1, -2))
         block(page, trends, 0)
+    }
+
+    private fun selectedActivityDate(today: LocalDate) = activityDate?.coerceAtMost(today) ?: today
+
+    private fun selectActivityDate(date: LocalDate) {
+        val today = LocalDate.now(band.zone)
+        val selected = date.coerceIn(FIRST_ACTIVITY_DATE, today)
+        if (selected == selectedActivityDate(today)) return
+        activityDate = selected.takeUnless { it == today }
+        currentDay = null
+        activityMinutes = null
+        dailyDial = null
+        readIssue = null
+        drawScreen()
+        animateIn(content, y = dp(8), duration = 200)
+        loadData()
+    }
+
+    private fun dailyActivity(page: LinearLayout) {
+        val zone = band.zone
+        val today = LocalDate.now(zone)
+        lastShownDate = today
+        val date = selectedActivityDate(today)
+        val day = currentDay
+        val minutes = activityMinutes
+        val bandCalories = day?.value(Metric.CALORIES)
+        val basal = basalKcalPerDay()
+        fun energy() = DailyEnergy.estimate(date, zone, Instant.now(), basal, bandCalories)
+
+        val canShare = day != null && (basal != null || bandCalories != null ||
+            minutes?.any { it > 0 } == true || day.value(Metric.STEPS) != null || day.value(Metric.DISTANCE) != null)
+        val share = if (!canShare) null else iconButton(Glyph.SHARE, "Share day", true) {
+            shareActivity(date, energy(), day, minutes?.sum())
+        }.apply { background = pressable(Color.TRANSPARENT, palette.ink, 16) }
+        pageHeader(page, trailing = share)
+        val calendar = row().apply {
+            minimumHeight = dp(48)
+            setPadding(dp(10), 0, dp(10), 0)
+            background = pressable(Color.TRANSPARENT, palette.ink, 12)
+            contentDescription = "Choose date, ${date.format(FULL_DATE)}"
+            isFocusable = true
+            setOnClickListener { chooseDate(date, today, select = ::selectActivityDate) }
+            addView(Icon(this@MainActivity, Glyph.CALENDAR, palette.muted), lp(dp(18), dp(18)))
+            addView(label(date.format(SHORT_DATE), 16, palette.ink, "sans-serif-medium").ignoreAccessibility(),
+                lp(-2, -2).apply { marginStart = dp(8) })
+            addView(Icon(this@MainActivity, Glyph.DOWN, palette.muted),
+                lp(dp(15), dp(15)).apply { marginStart = dp(4) })
+        }
+        page.addView(calendar, lp(-2, -2).apply { topMargin = dp(6) })
+        if (resources.configuration.screenWidthDp >= 390) activityWeek(page, date, today)
+        showReadIssues(page)
+
+        val calories = panel(radius = 22)
+        val details = column()
+        heading(details, "Estimated calorie burn", 0)
+        val total = readout("—", size = 42)
+        block(details, total, 2)
+        val values = listOf(bandCalories, minutes?.sum(), day?.value(Metric.STEPS))
+        val goals = Goal.entries.mapIndexed { index, goal ->
+            GoalProgress(values[index], displayPrefs.getInt(goal.name, goal.target), goalColor(goal))
+        }
+        if (stackTiles()) {
+            calories.addView(details, lp(-1, -2))
+        } else {
+            val energyLayout = row()
+            val dial = ActivityDial(this, palette, goals, dailyDial?.visibleProgress)
+            dailyDial = dial
+            energyLayout.addView(details, lp(0, -2, 1f))
+            energyLayout.addView(dial, lp(dp(96), dp(96)).apply { marginStart = dp(8) })
+            calories.addView(energyLayout, lp(-1, -2))
+        }
+        val resting = detailLine(calories, "Resting calories", open = ::editBasalEnergy)
+        updateEnergy = {
+            val estimate = energy()
+            total.text = estimate.total?.let { readoutText(number(it), "kcal") } ?: "—"
+            resting.text = estimate.resting?.let { displayValue(Metric.CALORIES, it) } ?: "Set BMR"
+            (resting.parent as View).contentDescription = if (estimate.resting == null) "Set BMR"
+                else "Edit BMR, resting calories ${resting.text}"
+        }
+        updateEnergy?.invoke()
+        when {
+            day == null && readIssue == null -> note(calories, "Loading activity…", 4)
+            day != null && bandCalories == null -> note(calories,
+                if (date == today) "Sync in Band for today’s total." else "No band calories for this day.", 4)
+        }
+        block(page, calories, 10)
+
+        val breakdown = panel(radius = 22)
+        for ((index, goal) in Goal.entries.withIndex()) {
+            val metric = goal.metric
+            if (index > 0) divider(breakdown)
+            val detail = column().apply { setPadding(0, dp(10), 0, dp(10)) }
+            val accent = goalColor(goal)
+            val value = values[index]
+            val target = number(goals[index].target.toLong())
+            val header = row()
+            header.addView(label(goal.title, 17, palette.ink, "sans-serif-medium").apply {
+                if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+            }, lp(0, -2, 1f).apply { marginEnd = dp(8) })
+            val progress = "${value?.let(::number) ?: "—"} / $target"
+            val progressText = if (goal == Goal.STEPS) progress else "$progress ${goal.unit}"
+            header.addView(label(progressText, 16, palette.ink, "sans-serif-medium").apply {
+                gravity = Gravity.END
+            }, lp(-2, -2))
+            block(detail, header, 0)
+            val buckets = if (metric != null) day?.buckets(metric) else minutes
+            if (!buckets.isNullOrEmpty() && value != null && (metric != null || value > 0)) {
+                plot(detail, dayPoints(buckets), metric, "${goal.title} by time of day", 9, accent = accent)
+            }
+            if (goal == Goal.STEPS) {
+                day?.value(Metric.DISTANCE)?.let { note(detail, "Distance · ${displayValue(Metric.DISTANCE, it)}", 8) }
+            }
+            block(breakdown, detail, 0)
+        }
+        block(page, breakdown, 10)
+    }
+
+    private fun shareActivity(date: LocalDate, energy: DailyEnergy, day: HealthStore.Day?, minutes: Long?) {
+        fun kcal(value: Long) = displayValue(Metric.CALORIES, value)
+        val message = buildList {
+            add("Daily activity · ${date.format(SHORT_DATE)}")
+            energy.total?.let { add("Estimated calorie burn: ${kcal(it)}") }
+            energy.resting?.let { add("Estimated resting calories: ${kcal(it)}") }
+            energy.band?.let { add("Band calories: ${kcal(it)}") }
+            minutes?.let { add("Workout time: ${duration(it.toInt())}") }
+            day?.value(Metric.STEPS)?.let { add("Steps: ${number(it)}") }
+            day?.value(Metric.DISTANCE)?.let { add("Distance: ${displayValue(Metric.DISTANCE, it)}") }
+        }.joinToString("\n")
+        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, message)
+        startActivity(Intent.createChooser(send, null))
+    }
+
+    private fun activityWeek(parent: LinearLayout, date: LocalDate, today: LocalDate) {
+        val locale = Locale.getDefault()
+        val firstDay = date.with(WeekFields.of(locale).dayOfWeek(), 1)
+        val days = row()
+        repeat(7) { index ->
+            val day = firstDay.plusDays(index.toLong())
+            val selected = day == date
+            val available = day in FIRST_ACTIVITY_DATE..today
+            val color = if (selected) palette.brand else if (available) palette.ink else palette.muted
+            val cell = column().apply {
+                gravity = Gravity.CENTER
+                minimumHeight = dp(48)
+                isSelected = selected
+                isEnabled = available
+                isFocusable = available
+                contentDescription = day.format(FULL_DATE)
+                if (available) {
+                    background = pressable(if (selected) palette.tint else Color.TRANSPARENT, palette.brand, 13)
+                    setOnClickListener { selectActivityDate(day) }
+                }
+                block(this, label(day.dayOfWeek.getDisplayName(TextStyle.NARROW, locale), 12, color).apply {
+                    gravity = Gravity.CENTER
+                }.ignoreAccessibility(), 0)
+                block(this, label(number(day.dayOfMonth.toLong()), 16, color, "sans-serif-medium").apply {
+                    gravity = Gravity.CENTER
+                }.ignoreAccessibility(), 2)
+            }
+            days.addView(cell, lp(0, -2, 1f))
+        }
+        block(parent, days, 5)
+    }
+
+    private fun detailLine(parent: LinearLayout, title: String, open: (() -> Unit)? = null): TextView {
+        val line = row()
+        val name = label(title, 14, palette.muted)
+        line.addView(name, lp(0, -2, 1f))
+        val value = label("—", 14, palette.ink, "sans-serif-medium").apply { gravity = Gravity.END }
+        line.addView(value, lp(-2, -2).apply { marginStart = dp(8) })
+        if (open != null) {
+            line.minimumHeight = dp(48)
+            line.isFocusable = true
+            line.background = pressable(Color.TRANSPARENT, palette.ink, 12)
+            line.setOnClickListener { open() }
+            name.ignoreAccessibility()
+            value.ignoreAccessibility()
+            line.addView(Icon(this, Glyph.RIGHT, palette.muted), lp(dp(15), dp(15)).apply { marginStart = dp(7) })
+        }
+        block(parent, line, 5)
+        return value
+    }
+
+    private fun basalKcalPerDay() = displayPrefs.getInt(BMR_KCAL, 0).takeIf { it > 0 }?.toDouble()
+        ?: workoutEnergyProfile?.basalKcalPerDay
+
+    private fun editBasalEnergy() {
+        showPopup("Resting calories", secure = true) { dialog ->
+            val name = "Basal metabolic rate (kcal/day)"
+            val input = popupInput(name, InputType.TYPE_CLASS_NUMBER).apply {
+                val digits = NumberFormat.getIntegerInstance().apply { isGroupingUsed = false }
+                basalKcalPerDay()?.let { setText(digits.format(it.roundToInt())) }
+                setSelectAllOnFocus(true)
+            }
+            block(this, label(name, 14, palette.muted).apply { labelFor = input.id }, 0)
+            block(this, input, 5)
+            addButton(this, "Estimate from body composition", filled = false, top = 10, action = ::estimateBasalEnergy)
+            popupActions(this, dialog, "Save") {
+                val kcal = input.text.toString().toIntOrNull()
+                if (kcal == null || kcal !in 1..10_000) {
+                    input.error = "Enter a daily BMR from 1 to ${number(10_000)} kcal."
+                    input.requestFocus()
+                } else saveBasalEnergy(dialog, kcal)
+            }
+            if (displayPrefs.contains(BMR_KCAL)) {
+                addButton(this, if (workoutEnergyProfile == null) "Clear BMR" else "Use build profile",
+                    filled = false, top = 8) { saveBasalEnergy(dialog, null) }
+            }
+        }
+    }
+
+    private fun estimateBasalEnergy() {
+        showPopup("Estimate daily BMR", secure = true) { dialog ->
+            val decimal = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            fun field(name: String, top: Int) = popupInput(name, decimal).also { input ->
+                block(this, label(name, 14, palette.muted).apply { labelFor = input.id }, top)
+                block(this, input, 5)
+            }
+            val weight = field("Weight (kg)", 0)
+            val bodyFat = field("Body fat (%)", 10)
+            fun decimalValue(input: EditText): Double? {
+                val text = input.text.toString().trim()
+                val position = java.text.ParsePosition(0)
+                val number = NumberFormat.getNumberInstance().apply { isGroupingUsed = false }.parse(text, position)
+                return number?.toDouble()?.takeIf { position.index == text.length && it.isFinite() }
+                    ?: text.toDoubleOrNull()?.takeIf { it.isFinite() }
+            }
+            popupActions(this, dialog, "Save estimate") {
+                val kg = decimalValue(weight)
+                val percent = decimalValue(bodyFat)
+                when {
+                    kg == null || kg <= 0 || kg > 400 -> {
+                        weight.error = "Enter a weight above 0 and up to 400 kg."
+                        weight.requestFocus()
+                    }
+                    percent == null || percent <= 0 || percent >= 100 -> {
+                        bodyFat.error = "Enter a percentage between 0 and 100."
+                        bodyFat.requestFocus()
+                    }
+                    else -> saveBasalEnergy(dialog, WorkoutEnergyProfile(kg, percent).basalKcalPerDay.roundToInt())
+                }
+            }
+        }
+    }
+
+    private fun saveBasalEnergy(dialog: Dialog, kcal: Int?) {
+        displayPrefs.edit { if (kcal == null) remove(BMR_KCAL) else putInt(BMR_KCAL, kcal) }
+        dialog.dismiss()
+        drawScreen(keepScroll = true)
     }
 
     private fun snapshot(title: String, value: String?, glyph: Glyph, accent: Int, open: () -> Unit) = column().apply {
@@ -758,7 +1039,7 @@ class MainActivity : ComponentActivity() {
     private fun health(page: LinearLayout) {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
-        block(page, heroAction("Measure", Glyph.PULSE, palette.heart, action = ::chooseMeasurement), 0)
+        block(page, primaryAction("Measure", Glyph.PULSE, action = ::chooseMeasurement), 0)
         heading(page, "Daily averages", 24)
         showReadIssues(page)
         val day = currentDay
@@ -901,8 +1182,9 @@ class MainActivity : ComponentActivity() {
         )
         groups.forEach { (name, types) ->
             if (types.size > 1) heading(page, name, 16)
-            val tiles = types.map { type ->
-                featureTile(type.title, type.icon, enabled = !workoutBusy) {
+            val choices = panel()
+            types.forEach { type ->
+                actionRow(choices, type.title, type.icon, enabled = !workoutBusy) {
                     val address = band.state.device?.address
                     val start = System.currentTimeMillis()
                     workoutPage = 0
@@ -910,7 +1192,7 @@ class MainActivity : ComponentActivity() {
                     go(backDestination())
                 }
             }
-            tileRows(page, tiles, if (types.size > 1) 9 else 14)
+            block(page, choices, if (types.size > 1) 9 else 14)
         }
     }
 
@@ -925,7 +1207,7 @@ class MainActivity : ComponentActivity() {
         val log = workouts
         val workout = log?.active
         if (workout == null) {
-            val start = heroAction("Start workout", Glyph.RUN, palette.workout, enabled = !workoutBusy && log != null) {
+            val start = primaryAction("Start workout", Glyph.RUN, enabled = !workoutBusy && log != null) {
                 go(Tab.WORKOUT_TYPES)
             }
             block(page, start, top)
@@ -1169,14 +1451,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun plot(parent: LinearLayout, points: List<ChartPoint>, metric: Metric?, title: String, top: Int,
-                     caption: Boolean = false, openPoint: ((Int) -> Unit)? = null) {
+                     caption: Boolean = false, accent: Int = palette.metric(metric), openPoint: ((Int) -> Unit)? = null) {
         fun description(point: ChartPoint): String {
             val value = point.value?.let { if (metric == null) duration(it.toInt()) else displayValue(metric, it) }
             return "${point.label}, ${value ?: "no reading"}"
         }
         if (caption) note(parent, title, top)
         val description = if (openPoint == null) "$title. " + points.joinToString(". ", transform = ::description) else null
-        val chart = BarChart(this, palette, points, description, palette.metric(metric), durationAxis = metric == null)
+        val chart = BarChart(this, palette, points, description, accent, durationAxis = metric == null)
         val frame = FrameLayout(this)
         frame.addView(chart, FrameLayout.LayoutParams(-1, -1))
         if (openPoint != null) {
@@ -1230,13 +1512,13 @@ class MainActivity : ComponentActivity() {
         loadData()
     }
 
-    private fun chooseDate(day: LocalDate, today: LocalDate, openingMonth: YearMonth = YearMonth.from(day)) {
+    private fun chooseDate(day: LocalDate, today: LocalDate, openingMonth: YearMonth = YearMonth.from(day),
+                           select: (LocalDate) -> Unit = ::selectDate) {
         val latest = YearMonth.from(today)
         val earliest = YearMonth.of(minOf(2000, day.year), 1)
         val locale = Locale.getDefault()
         val firstDay = WeekFields.of(locale).firstDayOfWeek
         val monthFormat = DateTimeFormatter.ofPattern("LLLL uuuu", locale)
-        val fullDate = DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL)
         var month = openingMonth
         showPopup("Choose date") { dialog ->
             val calendar = column()
@@ -1253,7 +1535,7 @@ class MainActivity : ComponentActivity() {
                     val years = (latest.year downTo earliest.year).toList()
                     showChoices("Choose year", years.map { Choice(it.toString(), Glyph.CALENDAR, it == month.year) }) {
                         val target = month.withYear(years[it]).coerceAtMost(latest)
-                        chooseDate(day, today, target)
+                        chooseDate(day, today, target, select)
                     }
                 }.apply { contentDescription = "${month.format(monthFormat)}, choose year" }, lp(0, -2, 1f))
                 header.addView(iconButton(Glyph.RIGHT, "Next month", month < latest) {
@@ -1279,14 +1561,14 @@ class MainActivity : ComponentActivity() {
                             15, if (date == day) palette.onAccent else if (date > today) palette.muted else palette.ink).apply {
                             gravity = Gravity.CENTER
                             background = pressable(if (date == day) palette.brand else Color.TRANSPARENT, palette.ink, 12)
-                            contentDescription = date.format(fullDate)
+                            contentDescription = date.format(FULL_DATE)
                             isSelected = date == day
                             isEnabled = date <= today
                             if (isEnabled) {
                                 isFocusable = true
                                 setOnClickListener {
                                     dialog.dismiss()
-                                    selectDate(date)
+                                    select(date)
                                 }
                             }
                         }
@@ -1305,10 +1587,10 @@ class MainActivity : ComponentActivity() {
         val current = state.connecting ?: state.device
         val connected = state.connection == Connection.CONNECTED
         val idle = state.action == BandAction.IDLE
-        val devicePanel = panel(radius = 26).apply { background = accentSurface(palette, palette.brand, 26) }
+        val devicePanel = panel(radius = 22)
         val identity = row()
         val words = column()
-        words.addView(label(current?.name ?: "Connect a band", 31, palette.ink, "sans-serif-medium").apply {
+        words.addView(label(current?.name ?: "Connect a band", 27, palette.ink, "sans-serif-medium").apply {
             letterSpacing = -.035f
             if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
         })
@@ -1321,8 +1603,8 @@ class MainActivity : ComponentActivity() {
             block(words, label(connectionText(state), 14, color, "sans-serif-medium"), 4)
         }
         identity.addView(words, lp(0, -2, 1f).apply { marginEnd = dp(10) })
-        identity.addView(iconBadge(Glyph.BAND, palette.brand, filled = true, glyphSize = 31),
-            lp(dp(60), dp(60)))
+        identity.addView(iconBadge(Glyph.BAND, palette.brand, filled = true, glyphSize = 25),
+            lp(dp(48), dp(48)))
         devicePanel.addView(identity, lp(-1, -2))
         state.battery?.let {
             val batteryLine = row()
@@ -1363,14 +1645,11 @@ class MainActivity : ComponentActivity() {
         if (state.connection == Connection.DISCONNECTED) nearbyBands(page, state)
 
         heading(page, "Tools", 24)
-        val tools = mutableListOf(featureTile("Phone clock", Glyph.CLOCK) { go(Tab.CLOCK) })
-        if (phoneCameraAvailable()) tools.add(featureTile("Camera remote", Glyph.CAMERA, action = ::openCamera))
-        tileRows(page, tools, 9)
-        if (connected) {
-            val find = panel()
-            actionRow(find, "Find band", Glyph.SCAN, idle) { band.findBand() }
-            block(page, find, 9)
-        }
+        val tools = panel()
+        actionRow(tools, "Phone clock", Glyph.CLOCK, true) { go(Tab.CLOCK) }
+        if (phoneCameraAvailable()) actionRow(tools, "Camera remote", Glyph.CAMERA, true, action = ::openCamera)
+        if (connected) actionRow(tools, "Find band", Glyph.SCAN, idle) { band.findBand() }
+        block(page, tools, 9)
 
         heading(page, "Alerts", 24)
         val alerts = panel()
@@ -1383,9 +1662,10 @@ class MainActivity : ComponentActivity() {
         }
         block(page, alerts, 9)
 
+        heading(page, "Settings", 25)
+        val actions = panel()
+        preferenceSwitch(actions, "Auto-sync", band.autoSync, change = band::setAutoSync)
         if (connected) {
-            heading(page, "Settings", 25)
-            val actions = panel()
             actionRow(actions, "Sync past 7 days", Glyph.CALENDAR, idle) { band.importHistory(true) }
             actionRow(actions, "Set band clock", Glyph.CLOCK, idle) { band.setClock() }
             val logging = state.automaticHeartLogging
@@ -1409,10 +1689,11 @@ class MainActivity : ComponentActivity() {
                 actionRow(actions, title, Glyph.MOON, idle) { detailsDialog(state.detailUsernameSet) }
             }
             actionRow(actions, "Disconnect", Glyph.BLUETOOTH, true) { band.disconnect() }
-            block(page, actions, 9)
         }
+        block(page, actions, 9)
         heading(page, "Data", 24)
         val data = panel()
+        actionRow(data, "Privacy", Glyph.CHECK, true) { go(Tab.PRIVACY) }
         actionRow(data, "Backup", Glyph.BACKUP, true) { go(Tab.BACKUP) }
         block(page, data, 9)
         if (state.connection == Connection.DISCONNECTED && state.device != null && !state.scanning) {
@@ -1446,6 +1727,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun privacyPage(page: LinearLayout) {
+        val permissions = panel()
+        val hasTelephony = packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
+        val bluetooth = if (Build.VERSION.SDK_INT >= 31) "Nearby devices" else "Location for scans"
+        fun status(allowed: Boolean) = if (allowed) "Allowed" else "Not allowed"
+        detailLine(permissions, bluetooth).text = status(BandClient.hasPermissions(this))
+        if (phoneCameraAvailable()) {
+            detailLine(permissions, "Camera").text =
+                status(checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+        }
+        if (hasTelephony) detailLine(permissions, "Phone").text = status(app.phoneVibration.phoneAccess)
+        actionRow(permissions, "Manage app permissions", Glyph.CHECK, true, action = ::openAppSettings)
+        block(page, permissions, 12)
+
+        val notifications = panel()
+        actionRow(notifications, "Notification access", Glyph.PHONE, true,
+            status(app.phoneVibration.notificationAccess), action = ::openNotificationAccess)
+        block(page, notifications, 10)
+    }
+
+    private fun openNotificationAccess() = startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+
     private fun vibrationPage(page: LinearLayout) {
         val vibration = app.phoneVibration
         if (!vibration.available) {
@@ -1454,7 +1757,7 @@ class MainActivity : ComponentActivity() {
         }
         if (packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)) {
             val calls = panel()
-            vibrationSwitch(calls, "Incoming calls", vibration.callsEnabled) { enabled ->
+            preferenceSwitch(calls, "Incoming calls", vibration.callsEnabled) { enabled ->
                 if (enabled && !vibration.phoneAccess) {
                     vibrationCallPermission.launch(Manifest.permission.READ_PHONE_STATE)
                 } else vibration.setCalls(enabled)
@@ -1465,9 +1768,7 @@ class MainActivity : ComponentActivity() {
         val apps = panel()
         if (!vibration.notificationAccess) {
             note(apps, "Allow notification access to choose apps.", 5)
-            addButton(apps, "Allow notification access", top = 10) {
-                startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-            }
+            addButton(apps, "Allow notification access", top = 10, action = ::openNotificationAccess)
         } else {
             val launchable = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val installed = packageManager.queryIntentActivities(launchable, 0)
@@ -1484,7 +1785,7 @@ class MainActivity : ComponentActivity() {
                     for ((info, name) in installed) {
                         if (!name.contains(query, ignoreCase = true)) continue
                         if (apps.isNotEmpty()) divider(apps)
-                        vibrationSwitch(apps, name, info.packageName in selected, info.loadIcon(packageManager)) {
+                        preferenceSwitch(apps, name, info.packageName in selected, info.loadIcon(packageManager)) {
                             vibration.setApp(info.packageName, it)
                         }
                     }
@@ -1500,7 +1801,7 @@ class MainActivity : ComponentActivity() {
         block(page, apps, 9)
     }
 
-    private fun vibrationSwitch(
+    private fun preferenceSwitch(
         parent: LinearLayout, title: String, checked: Boolean, icon: Drawable? = null, change: (Boolean) -> Unit
     ) {
         block(parent, Switch(this).apply {
@@ -1570,13 +1871,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun openAppSettings() =
+        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:$packageName".toUri()))
+
     private fun permissionSettings(title: String, message: String) {
-        val appSettings = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:$packageName".toUri())
         showPopup(title) { dialog ->
             note(this, message, 2)
             popupActions(this, dialog, "Open settings") {
                 dialog.dismiss()
-                startActivity(appSettings)
+                openAppSettings()
             }
         }
     }
@@ -1937,7 +2240,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun pageHeader(page: LinearLayout) {
+    private fun pageHeader(page: LinearLayout, trailing: View? = null) {
         val bar = row()
         val parent = backDestination()
         bar.addView(iconButton(Glyph.LEFT, "Back to ${parent.title}", true) { go(parent) }, lp(dp(48), dp(48)))
@@ -1945,85 +2248,50 @@ class MainActivity : ComponentActivity() {
             letterSpacing = -.033f
             if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
         }, lp(0, -2, 1f).apply { marginStart = dp(8) })
+        trailing?.let { bar.addView(it, lp(dp(48), dp(48)).apply { marginStart = dp(8) }) }
         block(page, bar, 0)
     }
 
-    private fun sectionHeader(
-        page: LinearLayout, title: String, action: String, top: Int, trailing: View? = null,
-        display: Boolean = false, open: () -> Unit
-    ) {
+    private fun sectionHeader(page: LinearLayout, title: String, action: String, top: Int, open: () -> Unit) {
         val header = row()
-        header.addView(label(title, if (display) 36 else 22, palette.ink, "sans-serif-medium").apply {
+        header.addView(label(title, 29, palette.ink, "sans-serif-medium").apply {
             letterSpacing = -.025f
             if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
         }, lp(0, -2, 1f))
         header.addView(button(action, filled = false, action = open).apply {
-            background = pressable(if (display) palette.container(palette.brand) else Color.TRANSPARENT, palette.brand, 15)
-            setPadding(dp(12), dp(6), dp(if (display) 12 else 0), dp(6))
+            background = pressable(Color.TRANSPARENT, palette.brand, 15)
+            setPadding(dp(12), dp(6), 0, dp(6))
         }, lp(-2, -2))
-        trailing?.let { header.addView(it, lp(dp(48), dp(48)).apply { marginStart = dp(8) }) }
         block(page, header, top)
     }
 
     private fun iconBadge(icon: Glyph, accent: Int, filled: Boolean = false, glyphSize: Int = 19) =
         FrameLayout(this).apply {
-            background = shape(if (filled) accent else palette.container(accent), if (glyphSize > 24) 18 else 11)
-            addView(Icon(this@MainActivity, icon, if (filled) palette.onAccent else accent),
+            val color = if (filled) accent else palette.brand
+            background = shape(palette.container(color), if (glyphSize > 24) 18 else 11)
+            addView(Icon(this@MainActivity, icon, color),
                 FrameLayout.LayoutParams(dp(glyphSize), dp(glyphSize), Gravity.CENTER))
         }
 
-    private fun heroAction(title: String, glyph: Glyph, accent: Int, enabled: Boolean = true, action: () -> Unit) =
+    private fun primaryAction(title: String, glyph: Glyph, enabled: Boolean = true, action: () -> Unit) =
         row().apply {
-            val fill = if (enabled) accent else palette.tint
+            val fill = if (enabled) palette.brand else palette.tint
             val ink = if (enabled) palette.onAccent else palette.muted
-            minimumHeight = dp(122)
-            setPadding(dp(19), dp(16), dp(16), dp(16))
-            background = pressable(fill, ink, 26)
+            minimumHeight = dp(64)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = pressable(fill, ink, 18)
             this.isEnabled = enabled
             isFocusable = enabled
             contentDescription = title
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
             if (enabled) setOnClickListener { action() }
-            addView(label(title, 33, ink, "sans-serif-medium").apply { letterSpacing = -.035f }.ignoreAccessibility(),
+            addView(label(title, 21, ink, "sans-serif-medium").ignoreAccessibility(),
                 lp(0, -2, 1f))
-            val emblem = FrameLayout(this@MainActivity).apply {
-                background = shape(ColorUtils.blendARGB(fill, ink, .13f), 23)
-                addView(Icon(this@MainActivity, glyph, ink), FrameLayout.LayoutParams(dp(39), dp(39), Gravity.CENTER))
-            }
-            addView(emblem, lp(dp(70), dp(70)).apply { marginStart = dp(9) })
+            addView(Icon(this@MainActivity, glyph, ink), lp(dp(24), dp(24)).apply { marginStart = dp(9) })
         }
-
-    private fun featureTile(title: String, glyph: Glyph, enabled: Boolean = true, action: () -> Unit) = column().apply {
-        val accent = if (enabled) palette.glyph(glyph) else palette.muted
-        setPadding(dp(14), dp(13), dp(14), dp(13))
-        minimumHeight = dp(90)
-        background = pressable(accentSurface(palette, accent, 20), accent, 20)
-        isEnabled = enabled
-        isFocusable = enabled
-        contentDescription = title
-        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-        if (enabled) setOnClickListener { action() }
-        val tools = row()
-        tools.addView(iconBadge(glyph, accent, filled = enabled), lp(dp(33), dp(33)))
-        tools.addView(View(this@MainActivity), lp(0, 1, 1f))
-        tools.addView(Icon(this@MainActivity, Glyph.RIGHT, accent), lp(dp(15), dp(15)))
-        addView(tools, lp(-1, -2))
-        block(this, label(title, 16, if (enabled) palette.ink else palette.muted, "sans-serif-medium").ignoreAccessibility(), 8)
-    }
 
     private fun stackTiles() = resources.configuration.let {
         it.screenWidthDp < 360 || (it.screenWidthDp < 560 && it.fontScale > 1.2f)
-    }
-
-    private fun tileRows(page: LinearLayout, tiles: List<View>, top: Int) {
-        val columns = if (stackTiles()) 1 else 2
-        for ((index, group) in tiles.chunked(columns).withIndex()) {
-            val line = row()
-            group.forEachIndexed { cell, tile ->
-                line.addView(tile, lp(0, -1, 1f).apply { if (cell != 0) marginStart = dp(9) })
-            }
-            block(page, line, if (index == 0) top else 9)
-        }
     }
 
     private fun TextView.ignoreAccessibility() = apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }
@@ -2125,9 +2393,11 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private val screenEasing = DecelerateInterpolator(1.8f)
-        private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH)
+        private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH, Tab.DAILY_ACTIVITY)
         private val HEALTH_METRICS = listOf(Metric.HEART, Metric.OXYGEN, Metric.HRV, Metric.STRESS)
         private val SHORT_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)
+        private val FULL_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL)
+        private val FIRST_ACTIVITY_DATE = LocalDate.of(2000, 1, 1)
         private val TIME = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
         private val DATE_TIME = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT)
         private val MONTH_DAY get() = DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(
@@ -2138,5 +2408,6 @@ class MainActivity : ComponentActivity() {
         private val CHART_HOUR = DateTimeFormatter.ofPattern("HH")
         private const val RAIL_SPACE = 108
         private const val WORKOUT_PAGE_SIZE = 15
+        private const val BMR_KCAL = "basalKcalPerDay"
     }
 }

@@ -18,11 +18,10 @@ internal data class Workout(
 }
 
 internal class WorkoutEnergyProfile(weightKg: Double, bodyFatPercent: Double) {
+    val basalKcalPerDay = 500 + 22 * weightKg * (1 - bodyFatPercent / 100) // Cunningham (1980)
     private val activeStrengthKcalPerMinute: Double
 
     init {
-        val fatFreeKg = weightKg * (1 - bodyFatPercent / 100)
-        val basalKcalPerDay = 500 + 22 * fatFreeKg // Cunningham (1980)
         val strengthMet = 3.5 // Adult Compendium 02054: resistance training, multiple exercises.
         val grossKcalPerMinute = strengthMet * 3.5 * weightKg / 200
         activeStrengthKcalPerMinute = (grossKcalPerMinute - basalKcalPerDay / 1_440).coerceAtLeast(0.0)

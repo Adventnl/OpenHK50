@@ -22,20 +22,20 @@ internal data class Palette(
     val background: Int, val surface: Int, val ink: Int, val muted: Int, val border: Int,
     val tint: Int, val night: Boolean
 ) {
-    val brand get() = accent(0xff6ff5bd, 0xff006949)
-    val warning get() = calories
-    val calories get() = accent(0xffffac74, 0xff984019)
-    val workout get() = accent(0xffc2a7ff, 0xff6543ad)
-    val steps get() = brand
-    val sleep get() = accent(0xff8bb7ff, 0xff2f59a8)
-    val heart get() = accent(0xffff8daa, 0xffa52750)
-    val oxygen get() = accent(0xff63e4ef, 0xff006770)
-    val stress get() = accent(0xffffd476, 0xff805406)
+    val brand get() = accent(0xffc1c9d7, 0xff465366)
+    val warning get() = heart
+    val calories get() = accent(0xffd5a6ab, 0xff854c58)
+    val workout get() = accent(0xffbeb1d1, 0xff655479)
+    val steps get() = accent(0xffa4bcd7, 0xff435f7c)
+    val sleep get() = accent(0xffaebad6, 0xff4f6186)
+    val heart get() = accent(0xffd3a1af, 0xff854b60)
+    val oxygen get() = accent(0xffa9bfc9, 0xff48626f)
+    val stress get() = accent(0xffcdb597, 0xff765b3c)
 
     private fun accent(dark: Long, light: Long) = (if (night) dark else light).toInt()
 
-    val onAccent get() = if (night) 0xff141021.toInt() else Color.WHITE
-    fun container(accent: Int) = ColorUtils.blendARGB(surface, accent, if (night) .18f else .09f)
+    val onAccent get() = if (night) 0xff17191d.toInt() else Color.WHITE
+    fun container(accent: Int) = ColorUtils.blendARGB(surface, accent, if (night) .12f else .055f)
     fun metric(metric: Metric?) = when (metric) {
         Metric.HEART -> heart
         Metric.OXYGEN -> oxygen
@@ -51,7 +51,8 @@ internal data class Palette(
         Glyph.PULSE, Glyph.PHONE -> heart
         Glyph.WALK, Glyph.RUN, Glyph.STRENGTH, Glyph.VARIABILITY, Glyph.BACKUP -> workout
         Glyph.CYCLE, Glyph.DROP, Glyph.BLUETOOTH -> oxygen
-        Glyph.HIKE, Glyph.TODAY, Glyph.STEPS, Glyph.SCAN, Glyph.BAND, Glyph.BATTERY -> brand
+        Glyph.STEPS -> steps
+        Glyph.HIKE, Glyph.TODAY, Glyph.SCAN, Glyph.BAND, Glyph.BATTERY -> brand
         Glyph.CLOCK, Glyph.MOON, Glyph.CALENDAR -> sleep
         Glyph.FLAME, Glyph.HIIT, Glyph.CAMERA -> calories
         Glyph.WAVE, Glyph.YOGA -> stress
@@ -60,11 +61,11 @@ internal data class Palette(
 
     companion object {
         fun of(night: Boolean) = if (night) Palette(
-            color("#10101B"), color("#1C1D30"), color("#F8F5FF"), color("#BCC0D9"),
-            color("#3B3D57"), color("#292A43"), true
+            color("#141518"), color("#202226"), color("#F3F3F5"), color("#B3B6BE"),
+            color("#3B3E45"), color("#30333A"), true
         ) else Palette(
-            color("#F3F2FB"), Color.WHITE, color("#1A1B31"), color("#4F546C"),
-            color("#D9DBED"), color("#E8E8F6"), false
+            color("#F3F4F6"), Color.WHITE, color("#22252B"), color("#555C68"),
+            color("#DADDE3"), color("#E8EBF0"), false
         )
 
         private fun color(hex: String) = Color.parseColor(hex)
@@ -120,10 +121,10 @@ internal val SleepStage.title get() = when (this) {
 }
 
 internal fun Palette.sleepColor(stage: SleepStage) = Color.parseColor(when (stage) {
-    SleepStage.LIGHT -> if (night) "#85B9E8" else "#4B85B9"
-    SleepStage.DEEP -> if (night) "#6579D4" else "#384B9D"
-    SleepStage.REM -> if (night) "#BEACF9" else "#8368BC"
-    SleepStage.AWAKE -> if (night) "#D2DAD4" else "#CAD3CC"
+    SleepStage.LIGHT -> if (night) "#A5B9D0" else "#5A7798"
+    SleepStage.DEEP -> if (night) "#788CAE" else "#425677"
+    SleepStage.REM -> if (night) "#BDB0D0" else "#79668E"
+    SleepStage.AWAKE -> if (night) "#D1D3D9" else "#A8ABB3"
 })
 
 internal fun Context.dp(value: Number) = (value.toFloat() * resources.displayMetrics.density).roundToInt()
@@ -136,13 +137,13 @@ internal fun Context.shape(color: Int, radius: Int, stroke: Int? = null) = Gradi
 
 internal fun Context.navigationGlass(palette: Palette, radius: Int, selected: Boolean = false): GradientDrawable {
     val colors = if (selected) {
-        if (palette.night) intArrayOf(0xff34594f.toInt(), 0xff243944.toInt())
-        else intArrayOf(0xffe0fff1.toInt(), 0xffd7efe9.toInt())
+        if (palette.night) intArrayOf(0xff3b3f48.toInt(), 0xff30333a.toInt())
+        else intArrayOf(0xffedf0f4.toInt(), 0xffe1e6ed.toInt())
     } else {
-        if (palette.night) intArrayOf(0xf02b3e43.toInt(), 0xee202335.toInt())
-        else intArrayOf(0xfaffffff.toInt(), 0xebe1f2ef.toInt())
+        if (palette.night) intArrayOf(0xf32c2e34.toInt(), 0xee202226.toInt())
+        else intArrayOf(0xfaffffff.toInt(), 0xf0f3f4f6.toInt())
     }
-    val rim = if (palette.night) 0x4ddef6e7 else 0xfaffffff.toInt()
+    val rim = if (palette.night) 0x45e1e4ea else 0xfaffffff.toInt()
     return GradientDrawable(GradientDrawable.Orientation.TL_BR, colors).apply {
         cornerRadius = dp(radius).toFloat()
         setStroke(dp(1), rim)
@@ -151,7 +152,7 @@ internal fun Context.navigationGlass(palette: Palette, radius: Int, selected: Bo
 
 internal fun Context.accentSurface(palette: Palette, accent: Int, radius: Int = 24) =
     GradientDrawable(GradientDrawable.Orientation.TR_BL, intArrayOf(
-        ColorUtils.blendARGB(palette.surface, accent, if (palette.night) .25f else .14f),
+        ColorUtils.blendARGB(palette.surface, accent, if (palette.night) .16f else .08f),
         palette.container(accent)
     )).apply { cornerRadius = dp(radius).toFloat() }
 
@@ -165,7 +166,7 @@ internal fun Context.pressable(fill: Drawable, ink: Int, radius: Int) = RippleDr
 internal enum class Glyph {
     PULSE, CALENDAR, BAND, BACKUP, WALK, BATTERY, LEFT, RIGHT, DOWN, BLUETOOTH, CHECK, CLOCK,
     DROP, WAVE, VARIABILITY, SCAN, MOON, TODAY, CAMERA, PHONE, STEPS, FLAME,
-    RUN, CYCLE, HIKE, HIIT, STRENGTH, YOGA
+    RUN, CYCLE, HIKE, HIIT, STRENGTH, YOGA, SHARE
 }
 
 internal class Icon(context: Context, private val glyph: Glyph, private val color: Int) : View(context) {
@@ -197,6 +198,11 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
             canvas.drawRoundRect(l, t, r, b, radius, radius, paint)
 
         when (glyph) {
+            Glyph.SHARE -> {
+                path(12f, 15f, 12f, 3f, 8f, 7f)
+                path(12f, 3f, 16f, 7f)
+                path(6f, 11f, 4f, 11f, 4f, 21f, 20f, 21f, 20f, 11f, 18f, 11f)
+            }
             Glyph.TODAY -> {
                 canvas.drawArc(3f, 3f, 21f, 21f, 120f, 300f, false, paint)
                 canvas.drawArc(7f, 7f, 17f, 17f, 120f, 235f, false, paint)

@@ -126,18 +126,32 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         WHERE workout_ms=? AND resume_ms IS NULL
     """.trimIndent(), arrayOf(now, start))
 
-    internal fun workoutMinutes(date: LocalDate, zone: ZoneId): Long {
-        val start = date.atStartOfDay(zone).toInstant().toEpochMilli().toString()
-        val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli().toString()
+    internal fun workoutMinutes(date: LocalDate, zone: ZoneId): Long =
+        workoutMinuteBuckets(listOf(date.atStartOfDay(zone).toInstant().toEpochMilli(),
+            date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli())).single()
+
+    internal fun workoutMinuteBuckets(boundaries: List<Long>): List<Long> {
+        val buckets = boundaries.zipWithNext()
+        val bounds = buckets.indices.joinToString(", ") { "($it, CAST(? AS INTEGER), CAST(? AS INTEGER))" }
+        val args = buckets.flatMap { (start, end) -> listOf(start.toString(), end.toString()) }.toTypedArray()
         return readableDatabase.rawQuery("""
-            WITH bounds AS (SELECT CAST(? AS INTEGER) AS day_start, CAST(? AS INTEGER) AS day_end)
+            WITH bounds(bucket, day_start, day_end) AS (VALUES $bounds)
             SELECT coalesce(sum(min(end_ms, day_end) - max(start_ms, day_start) - coalesce((
                 SELECT sum(min(resume_ms, day_end) - max(pause_ms, day_start)) FROM workout_pauses
                 WHERE workout_ms=start_ms AND pause_ms<day_end AND resume_ms>day_start
-            ), 0)), 0) FROM workouts CROSS JOIN bounds WHERE start_ms<day_end AND end_ms>day_start
-        """.trimIndent(), arrayOf(start, end)).use { cursor ->
-            cursor.moveToFirst()
-            cursor.getLong(0) / 60_000
+            ), 0)), 0)
+            FROM bounds LEFT JOIN workouts ON start_ms<day_end AND end_ms>day_start
+            GROUP BY bucket ORDER BY bucket
+        """.trimIndent(), args).use { cursor ->
+            // Round running totals so the chart buckets add up to the day's displayed minutes.
+            var elapsed = 0L
+            buildList {
+                while (cursor.moveToNext()) {
+                    val earlierMinutes = elapsed / 60_000
+                    elapsed += cursor.getLong(0)
+                    add(elapsed / 60_000 - earlierMinutes)
+                }
+            }
         }
     }
 

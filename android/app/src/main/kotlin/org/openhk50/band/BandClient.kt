@@ -72,6 +72,8 @@ internal class BandClient(
     private val connectionNeeded get() = foreground || keepConnected
     private var retryConnection = false
     private var autoReconnect = prefs.getBoolean("autoReconnect", true)
+    var autoSync = prefs.getBoolean("autoSync", true)
+        private set
     private var closingAfterMeasurement = false
     private var reopenAfterMeasurement = false
     private var exchange: Exchange? = null
@@ -257,8 +259,19 @@ internal class BandClient(
     }
 
     private fun beginConnectedSync() {
-        state = state.copy(action = BandAction.IDLE)
-        importHistory(false)
+        if (autoSync) {
+            state = state.copy(action = BandAction.IDLE)
+            importHistory(false)
+        } else {
+            readBattery { finish(null) }
+        }
+    }
+
+    fun setAutoSync(enabled: Boolean) {
+        if (autoSync == enabled) return
+        autoSync = enabled
+        prefs.edit().putBoolean("autoSync", enabled).apply()
+        if (enabled) importHistory(false) else main.removeCallbacks(refresh)
     }
 
     override fun lost(message: String) {
@@ -279,11 +292,15 @@ internal class BandClient(
         stepsReceived = false
         publish(state.copy(action = BandAction.IMPORTING, progress = 0, days = days, message = null))
         val today = LocalDate.now(zone)
+        readBattery { importDay(device, today, 0) }
+    }
+
+    private fun readBattery(done: () -> Unit) {
         request(NativeProtocol.packet(BATTERY), 3_000) { result ->
             result.frames.firstOrNull()?.let {
                 publish(state.copy(battery = it[1].toInt() and 255, charging = it[2].toInt() != 0))
             }
-            importDay(device, today, 0)
+            done()
         }
     }
 
@@ -588,8 +605,8 @@ internal class BandClient(
         state.device?.takeIf { connectionNeeded && state.connection == Connection.CONNECTED && state.action == BandAction.IDLE }
 
     private fun finish(message: String?) {
-        if (connectionNeeded) {
-            main.removeCallbacks(refresh)
+        main.removeCallbacks(refresh)
+        if (connectionNeeded && autoSync) {
             main.postDelayed(refresh, 5 * 60_000L)
         }
         publish(state.copy(action = BandAction.IDLE, message = message))
