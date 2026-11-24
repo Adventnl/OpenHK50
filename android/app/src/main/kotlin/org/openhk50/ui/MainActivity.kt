@@ -1,5 +1,6 @@
 package org.openhk50.ui
 
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.Manifest
 import android.app.Dialog
@@ -10,6 +11,7 @@ import android.content.res.Configuration
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -20,6 +22,7 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.Window
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -38,6 +41,7 @@ import androidx.core.content.edit
 import androidx.core.graphics.ColorUtils
 import androidx.core.net.toUri
 import androidx.core.view.isNotEmpty
+import androidx.core.widget.doAfterTextChanged
 import org.openhk50.BuildConfig
 import org.openhk50.OpenHkApp
 import org.openhk50.band.BandAction
@@ -91,6 +95,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var content: FrameLayout
     private lateinit var navigation: LinearLayout
     private var scroll: ScrollView? = null
+    private var todayDial: ActivityDial? = null
     private var tab = Tab.TODAY
     private var detailParent = Tab.TODAY
     private var historyMetric: Metric? = Metric.HEART
@@ -140,6 +145,7 @@ class MainActivity : ComponentActivity() {
     private var permissionAction: PermissionAction? = null
     private var backCallback: OnBackInvokedCallback? = null
     private var expanded = false
+    private var keyboardVisible = false
     private var active = false
     private var lastDevice: String? = null
     private var lastShownDate: LocalDate? = null
@@ -310,7 +316,13 @@ class MainActivity : ComponentActivity() {
         root.setOnApplyWindowInsetsListener { view, insets ->
             if (Build.VERSION.SDK_INT >= 30) {
                 val safe = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
-                view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+                val keyboard = insets.getInsets(WindowInsets.Type.ime()).bottom
+                view.setPadding(safe.left, safe.top, safe.right, maxOf(keyboard, safe.bottom))
+                val showing = keyboard > safe.bottom
+                if (showing != keyboardVisible) {
+                    keyboardVisible = showing
+                    updateNavigationVisibility()
+                }
             } else {
                 @Suppress("DEPRECATION")
                 view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
@@ -348,17 +360,24 @@ class MainActivity : ComponentActivity() {
 
     private fun updateScrollInsets() {
         val viewport = scroll ?: return
-        val side = if (expanded) dp(RAIL_SPACE) else 0
-        val bottom = if (expanded) 0 else maxOf(navigation.height, dp(60)) + dp(9)
+        val visible = navigation.visibility == View.VISIBLE
+        val side = if (visible && expanded) dp(RAIL_SPACE) else 0
+        val bottom = if (visible && !expanded) maxOf(navigation.height, dp(60)) + dp(9) else 0
         viewport.setPaddingRelative(side, 0, 0, bottom)
     }
 
-    private fun drawNavigation() {
+    private fun updateNavigationVisibility() {
+        navigation.visibility = if (keyboardVisible || tab == Tab.CAMERA || tab == Tab.CLOCK) View.GONE else View.VISIBLE
+        updateScrollInsets()
+    }
+
+    private fun drawNavigation(previous: Tab? = null) {
         navigation.removeAllViews()
-        navigation.visibility = if (tab == Tab.CAMERA || tab == Tab.CLOCK) View.GONE else View.VISIBLE
+        updateNavigationVisibility()
         for (item in Tab.entries.filter { it.inNavigation }) {
             val selected = item == tab || (!tab.inNavigation && item == backDestination())
-            val color = if (selected) palette.brand else palette.muted
+            val iconColor = if (selected) palette.glyph(item.icon) else palette.muted
+            val textColor = if (selected) palette.brand else palette.muted
             val cell = column().apply {
                 gravity = Gravity.CENTER
                 minimumHeight = dp(if (expanded) 58 else 52)
@@ -370,18 +389,26 @@ class MainActivity : ComponentActivity() {
                 foreground = pressable(Color.TRANSPARENT, palette.ink, 24)
                 setOnClickListener { go(item) }
             }
-            cell.addView(Icon(this, item.icon, color), lp(dp(21), dp(21)))
-            cell.addView(label(item.title, 12, color, if (selected) "sans-serif-medium" else "sans-serif")
+            cell.addView(Icon(this, item.icon, iconColor), lp(dp(21), dp(21)))
+            cell.addView(label(item.title, 12, textColor, if (selected) "sans-serif-medium" else "sans-serif")
                 .apply {
                     gravity = Gravity.CENTER
                     importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 }, lp(-1, -2).apply { topMargin = dp(4) })
             navigation.addView(cell, if (expanded) lp(-1, -2) else lp(0, -2, 1f))
+            if (selected && previous != null && item != previous && ValueAnimator.areAnimatorsEnabled()) {
+                cell.scaleX = .9f
+                cell.scaleY = .9f
+                cell.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(screenEasing).start()
+            }
         }
     }
 
     private fun go(next: Tab) {
         if (tab == next) return
+        val previous = tab
+        val returning = next == backDestination()
+        val previousSection = if (previous.inNavigation) previous else backDestination()
         if (tab == Tab.MEASURE) stopHealthMeasurement()
         val previousCamera = camera
         camera = null
@@ -393,10 +420,28 @@ class MainActivity : ComponentActivity() {
         if (next == Tab.HISTORY || next in DAILY_TABS) currentDay = null
         if (next == Tab.TODAY) summary = null
         if (next == Tab.HISTORY) trend = null
-        drawNavigation()
+        if (next != Tab.TODAY) todayDial = null
+        drawNavigation(previousSection)
         updateBack()
         drawScreen()
+        val axis = if (root.layoutDirection == View.LAYOUT_DIRECTION_RTL) -1 else 1
+        val direction = when {
+            previous.inNavigation && next.inNavigation -> if (next.ordinal > previous.ordinal) 1 else -1
+            returning -> -1
+            else -> 1
+        }
+        animateIn(content, x = dp(if (previous.inNavigation && next.inNavigation) 18 else 28) * direction * axis)
         loadData()
+    }
+
+    private fun animateIn(view: View, x: Int = 0, y: Int = 0, duration: Long = 270) {
+        view.animate().cancel()
+        val animate = ValueAnimator.areAnimatorsEnabled()
+        view.alpha = if (animate) .55f else 1f
+        view.translationX = if (animate) x.toFloat() else 0f
+        view.translationY = if (animate) y.toFloat() else 0f
+        if (animate) view.animate().alpha(1f).translationX(0f).translationY(0f)
+            .setDuration(duration).setInterpolator(screenEasing).start()
     }
 
     private fun backDestination() = when (tab) {
@@ -508,7 +553,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         val previous = if (keepScroll) scroll?.scrollY ?: 0 else 0
-        val page = column().apply { setPadding(dp(18), dp(12), dp(18), dp(24)) }
+        val page = column().apply { setPadding(dp(18), dp(16), dp(18), dp(24)) }
         val viewport = ScrollView(this).apply {
             isFillViewport = true
             isVerticalScrollBarEnabled = false
@@ -546,21 +591,21 @@ class MainActivity : ComponentActivity() {
             openHistory(Metric.STEPS, today)
         }
         showReadIssues(page)
-        sectionHeader(page, "Activity", "Goals", 0, trailing = calendar, open = ::editGoals)
-        val activity = panel()
+        sectionHeader(page, "Activity", "Goals", 0, trailing = calendar, display = true, open = ::editGoals)
+        val activity = panel(radius = 26).apply { background = accentSurface(palette, palette.workout, 26) }
         val values = listOf(day?.value(Metric.CALORIES), summary?.workoutMinutes, day?.value(Metric.STEPS))
         val goals = Goal.entries.mapIndexed { index, goal ->
             GoalProgress(values[index], displayPrefs.getInt(goal.name, goal.target), goalColor(goal))
         }
-        val stack = resources.configuration.screenWidthDp < 360 || resources.configuration.fontScale > 1.2f
+        val stack = stackTiles()
         val layout = if (stack) column() else row()
         val progress = column()
         for ((index, goal) in Goal.entries.withIndex()) {
             val reading = goals[index]
             val item = column().apply {
-                minimumHeight = dp(50)
-                setPadding(0, dp(3), 0, dp(3))
-                background = pressable(Color.TRANSPARENT, palette.ink, 10)
+                minimumHeight = dp(54)
+                setPadding(dp(6), dp(4), dp(6), dp(4))
+                background = pressable(Color.TRANSPARENT, reading.color, 10)
                 val value = reading.value?.let(::number) ?: "—"
                 val target = number(reading.target.toLong())
                 contentDescription = "${goal.title}, ${reading.value?.let { "$value of $target ${goal.unit}" } ?: "no reading, goal $target ${goal.unit}"}"
@@ -570,9 +615,13 @@ class MainActivity : ComponentActivity() {
                     val metric = goal.metric
                     if (metric == null) go(Tab.ACTIVITY) else openHistory(metric, today)
                 }
-                addView(label(goal.title, 13, palette.muted, "sans-serif-medium").ignoreAccessibility())
+                val legend = row()
+                legend.addView(View(this@MainActivity).apply { background = shape(reading.color, 4) }, lp(dp(7), dp(7)))
+                legend.addView(label(goal.title, 13, palette.ink, "sans-serif-medium").ignoreAccessibility(),
+                    lp(0, -2, 1f).apply { marginStart = dp(6) })
+                addView(legend, lp(-1, -2))
                 val suffix = if (goal == Goal.STEPS) " / $target" else " / $target ${goal.unit}"
-                addView(label(value + suffix, 22, reading.color, "sans-serif-medium").apply {
+                addView(label(value + suffix, 25, reading.color, "sans-serif-medium").apply {
                     letterSpacing = -.025f
                     val styled = android.text.SpannableString(text)
                     styled.setSpan(android.text.style.RelativeSizeSpan(.57f), value.length, text.length, 0)
@@ -582,20 +631,26 @@ class MainActivity : ComponentActivity() {
             }
             progress.addView(item, lp(-1, -2))
         }
-        val chart = ActivityDial(this, palette, goals)
+        val chart = ActivityDial(this, palette, goals, todayDial?.visibleProgress)
+        todayDial = chart
         if (stack) {
-            layout.addView(chart, lp(dp(146), dp(146)).apply { gravity = Gravity.CENTER_HORIZONTAL })
+            layout.addView(chart, lp(dp(160), dp(160)).apply { gravity = Gravity.CENTER_HORIZONTAL })
             layout.addView(progress, lp(-1, -2))
         } else {
+            val dialSize = when {
+                expanded -> 216
+                resources.configuration.screenWidthDp >= 405 -> 172
+                else -> 150
+            }
+            layout.addView(chart, lp(dp(dialSize), dp(dialSize)).apply { marginEnd = dp(12) })
             layout.addView(progress, lp(0, -2, 1f))
-            layout.addView(chart, lp(dp(152), dp(152)).apply { marginStart = dp(6) })
         }
         activity.addView(layout, lp(-1, -2))
         divider(activity)
         activity.addView(summaryRow(Metric.DISTANCE, day?.value(Metric.DISTANCE)) {
             openHistory(Metric.DISTANCE, today)
         }, lp(-1, -2))
-        block(page, activity, 0)
+        block(page, activity, 8)
 
         val snapshots = if (stack) column() else row().apply { gravity = Gravity.TOP }
         val steps = snapshot("Yesterday’s steps", summary?.previousSteps?.let(::number), Glyph.STEPS, palette.steps) {
@@ -611,7 +666,7 @@ class MainActivity : ComponentActivity() {
             snapshots.addView(steps, lp(0, -2, 1f))
             snapshots.addView(sleep, lp(0, -2, 1f).apply { marginStart = dp(8) })
         }
-        block(page, snapshots, 8)
+        block(page, snapshots, 10)
 
         sectionHeader(page, "Workouts", "View all", 17) { go(Tab.ACTIVITY) }
         val log = workouts
@@ -621,7 +676,7 @@ class MainActivity : ComponentActivity() {
             log?.recent.isNullOrEmpty() -> {
                 val empty = panel()
                 if (log == null) note(empty, if (readIssue == null) "Loading workouts…" else "Workouts unavailable", 3)
-                else actionRow(empty, "Start workout", Glyph.WALK, !workoutBusy) { go(Tab.WORKOUT_TYPES) }
+                    else actionRow(empty, "Start workout", Glyph.RUN, !workoutBusy) { go(Tab.WORKOUT_TYPES) }
                 block(page, empty, 0)
             }
             else -> workoutRecords(page, log.recent)
@@ -642,19 +697,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun snapshot(title: String, value: String?, glyph: Glyph, accent: Int, open: () -> Unit) = column().apply {
-        setPadding(dp(13), dp(12), dp(13), dp(13))
-        background = pressable(palette.surface, palette.ink, 15)
+        setPadding(dp(15), dp(13), dp(15), dp(14))
+        background = pressable(accentSurface(palette, accent, 21), accent, 21)
         isFocusable = true
         contentDescription = "$title, ${value ?: "no reading"}"
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         setOnClickListener { open() }
         val header = row().apply { gravity = Gravity.CENTER_VERTICAL }
-        header.addView(Icon(this@MainActivity, glyph, accent), lp(dp(17), dp(17)))
+        header.addView(iconBadge(glyph, accent, filled = true), lp(dp(33), dp(33)))
         header.addView(View(this@MainActivity), lp(0, 1, 1f))
-        header.addView(Icon(this@MainActivity, Glyph.RIGHT, palette.muted), lp(dp(14), dp(14)))
+        header.addView(Icon(this@MainActivity, Glyph.RIGHT, accent), lp(dp(14), dp(14)))
         addView(header, lp(-1, -2))
-        block(this, label(title, 13, palette.muted, "sans-serif-medium").ignoreAccessibility(), 7)
-        block(this, label(value ?: "—", 23, palette.ink, "sans-serif-medium").apply { letterSpacing = -.025f }
+        block(this, label(title, 13, palette.ink, "sans-serif-medium").ignoreAccessibility(), 9)
+        block(this, label(value ?: "—", 25, accent, "sans-serif-medium").apply { letterSpacing = -.025f }
             .ignoreAccessibility(), 3)
     }
 
@@ -703,8 +758,8 @@ class MainActivity : ComponentActivity() {
     private fun health(page: LinearLayout) {
         val today = LocalDate.now(band.zone)
         lastShownDate = today
-        addButton(page, "Measure", top = 0, action = ::chooseMeasurement)
-        heading(page, "Daily averages", 15)
+        block(page, heroAction("Measure", Glyph.PULSE, palette.heart, action = ::chooseMeasurement), 0)
+        heading(page, "Daily averages", 24)
         showReadIssues(page)
         val day = currentDay
         val metrics = panel()
@@ -745,20 +800,21 @@ class MainActivity : ComponentActivity() {
 
     private fun measurementPage(page: LinearLayout) {
         val metric = measureMetric
-        val live = panel()
-        section(live, metric.icon, metric.title, palette.brand)
-        val value = readout("—", size = 54)
+        val accent = palette.metric(metric)
+        val live = panel(radius = 26).apply { background = accentSurface(palette, accent, 26) }
+        section(live, metric.icon, metric.title, accent)
+        val value = readout("—", size = 58, accent = accent)
         val status = label("", 14, palette.muted).apply {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         block(live, value, 14)
         block(live, status, 5)
-        val start = button("Start measurement", filled = true) { band.measure(metric) }
+        val start = button("Start measurement", filled = true, accent = accent) { band.measure(metric) }
         val stop = button("Stop measurement", filled = false) {
             stopHealthMeasurement()
             updateMeasurement()
         }
-        val connect = button("Open Band", filled = false) { go(Tab.BAND) }
+        val connect = button("Open Band", filled = false, accent = accent) { go(Tab.BAND) }
         block(live, start, 14)
         block(live, stop, 14)
         block(live, connect, 14)
@@ -821,7 +877,8 @@ class MainActivity : ComponentActivity() {
         for (record in workouts) {
             if (records.childCount > 0) divider(records)
             val line = row().apply { setPadding(0, dp(8), 0, dp(8)); minimumHeight = dp(54) }
-            line.addView(iconBadge(Glyph.WALK, palette.workout), lp(dp(34), dp(34)))
+            val accent = palette.glyph(record.type.icon)
+            line.addView(iconBadge(record.type.icon, accent), lp(dp(36), dp(36)))
             val identity = column()
             identity.addView(label(record.type.title, 15, palette.ink, "sans-serif-medium"))
             val date = Instant.ofEpochMilli(record.start).atZone(band.zone).toLocalDate()
@@ -829,7 +886,7 @@ class MainActivity : ComponentActivity() {
             note(identity, date.format(MONTH_DAY) + heart, 3)
             workoutCaloriesText(record, 0)?.let { note(identity, it, 3) }
             line.addView(identity, lp(0, -2, 1f).apply { marginStart = dp(10) })
-            line.addView(label(sessionDuration(record), 15, palette.workout, "sans-serif-medium"),
+            line.addView(label(sessionDuration(record), 15, accent, "sans-serif-medium"),
                 lp(-2, -2).apply { marginStart = dp(8) })
             records.addView(line, lp(-1, -2))
         }
@@ -844,15 +901,16 @@ class MainActivity : ComponentActivity() {
         )
         groups.forEach { (name, types) ->
             if (types.size > 1) heading(page, name, 16)
-            val choices = panel()
-            for (type in types) actionRow(choices, type.title, Glyph.WALK, !workoutBusy) {
-                val address = band.state.device?.address
-                val start = System.currentTimeMillis()
-                workoutPage = 0
-                changeWorkout { app.health.startWorkout(type, start, address) }
-                go(backDestination())
+            val tiles = types.map { type ->
+                featureTile(type.title, type.icon, enabled = !workoutBusy) {
+                    val address = band.state.device?.address
+                    val start = System.currentTimeMillis()
+                    workoutPage = 0
+                    changeWorkout { app.health.startWorkout(type, start, address) }
+                    go(backDestination())
+                }
             }
-            block(page, choices, if (types.size > 1) 7 else 13)
+            tileRows(page, tiles, if (types.size > 1) 9 else 14)
         }
     }
 
@@ -867,34 +925,35 @@ class MainActivity : ComponentActivity() {
         val log = workouts
         val workout = log?.active
         if (workout == null) {
-            addButton(page, "Start workout", enabled = !workoutBusy && log != null, top = top) {
+            val start = heroAction("Start workout", Glyph.RUN, palette.workout, enabled = !workoutBusy && log != null) {
                 go(Tab.WORKOUT_TYPES)
             }
+            block(page, start, top)
             return
         }
         val paused = workout.pausedAt != null
-        val recorder = panel()
+        val recorder = panel(radius = 26).apply { background = accentSurface(palette, palette.workout, 26) }
         val header = row()
-        header.addView(iconBadge(Glyph.WALK, palette.workout), lp(dp(34), dp(34)))
+        header.addView(iconBadge(workout.type.icon, palette.workout, filled = true), lp(dp(36), dp(36)))
         header.addView(label(workout.type.title, 17, palette.ink, "sans-serif-medium"),
             lp(0, -2, 1f).apply { marginStart = dp(10) })
         header.addView(label(if (paused) "Paused" else "In progress", 13, palette.workout))
         block(recorder, header, 0)
         val now = System.currentTimeMillis()
-        workoutTimer = readout(workoutDuration(workout.seconds(now)), size = 38)
+        workoutTimer = readout(workoutDuration(workout.seconds(now)), size = 48, accent = palette.workout)
             .also { block(recorder, it, 8) }
         workoutCalories = workoutCaloriesText(workout, now)?.let { text ->
             label(text, 14, palette.muted).also { block(recorder, it, 4) }
         }
         if (active && !paused) app.main.postDelayed(tickWorkout, 1_000)
         val controls = row()
-        controls.addView(button(if (paused) "Resume" else "Pause", filled = true, enabled = !workoutBusy) {
+        controls.addView(button(if (paused) "Resume" else "Pause", filled = true, enabled = !workoutBusy, accent = palette.workout) {
             val now = System.currentTimeMillis()
             changeWorkout {
                 if (paused) app.health.resumeWorkout(workout.start, now) else app.health.pauseWorkout(workout.start, now)
             }
         }, lp(0, -2, 1f))
-        controls.addView(button("End workout", filled = false, enabled = !workoutBusy) {
+        controls.addView(button("End workout", filled = false, enabled = !workoutBusy, accent = palette.workout) {
             workoutPage = 0
             val now = System.currentTimeMillis()
             changeWorkout { app.health.endWorkout(workout.start, now) }
@@ -945,9 +1004,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun summaryRow(metric: Metric, value: Long?, action: () -> Unit) =
-        summaryRow(metric.title, metric.icon, value?.let { displayValue(metric, it) }, action = action)
+        summaryRow(metric.title, metric.icon, value?.let { displayValue(metric, it) }, accent = palette.metric(metric), action = action)
 
-    private fun summaryRow(title: String, icon: Glyph, value: String?, showMissing: Boolean = true, action: () -> Unit) = row().apply {
+    private fun summaryRow(
+        title: String, icon: Glyph, value: String?, showMissing: Boolean = true,
+        accent: Int = palette.glyph(icon), action: () -> Unit
+    ) = row().apply {
         minimumHeight = dp(55)
         setPadding(0, dp(7), 0, dp(7))
         background = pressable(Color.TRANSPARENT, palette.ink, 11)
@@ -955,11 +1017,11 @@ class MainActivity : ComponentActivity() {
         contentDescription = if (value != null || showMissing) "$title, ${value ?: "no reading"}" else title
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         setOnClickListener { action() }
-        addView(Icon(this@MainActivity, icon, palette.ink), lp(dp(22), dp(22)))
+        addView(iconBadge(icon, accent, filled = true), lp(dp(32), dp(32)))
         addView(label(title, 16, palette.ink, "sans-serif-medium")
             .apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }, lp(0, -2, 1f).apply { marginStart = dp(12) })
         if (value != null || showMissing) {
-            val reading = label(value ?: "—", 15, palette.muted).apply {
+            val reading = label(value ?: "—", 15, if (value == null) palette.muted else accent, "sans-serif-medium").apply {
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
             addView(reading, lp(-2, -2).apply { marginStart = dp(8) })
@@ -974,17 +1036,18 @@ class MainActivity : ComponentActivity() {
         val end = period.endDate(historyDate, today)
         val dates = period.dates(end)
         val metric = historyMetric
+        val accent = palette.metric(metric)
         val metricName = metric?.title ?: "Sleep"
         val picker = row().apply {
             minimumHeight = dp(60)
             setPadding(dp(16), dp(8), dp(16), dp(8))
-            background = pressable(palette.surface, palette.ink, 20)
+            background = pressable(accentSurface(palette, accent, 18), accent, 18)
             contentDescription = "$metricName, choose metric"
             isFocusable = true
-            addView(Icon(this@MainActivity, metric?.icon ?: Glyph.MOON, palette.ink), lp(dp(22), dp(22)))
+            addView(iconBadge(metric?.icon ?: Glyph.MOON, accent, filled = true), lp(dp(34), dp(34)))
             addView(label(metricName, 18, palette.ink, "sans-serif-medium"),
                 lp(0, -2, 1f).apply { marginStart = dp(11) })
-            addView(Icon(this@MainActivity, Glyph.DOWN, palette.ink), lp(dp(19), dp(19)))
+            addView(Icon(this@MainActivity, Glyph.DOWN, accent), lp(dp(19), dp(19)))
             setOnClickListener {
                 val choices = Metric.entries.map { Choice(it.title, it.icon, it == metric) } +
                     Choice("Sleep", Glyph.MOON, metric == null)
@@ -1001,14 +1064,14 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(4), dp(4), dp(4), dp(4))
         }
         for (choice in HistoryPeriod.entries) {
-            val control = button(choice.title, filled = false) {
+            val control = button(choice.title, filled = period == choice, accent = accent) {
                 if (historyPeriod != choice) {
                     historyPeriod = choice
                     selectDate(historyDate)
                 }
             }.apply {
                 isSelected = period == choice
-                background = pressable(if (isSelected) palette.surface else Color.TRANSPARENT, palette.ink, 15)
+                if (!isSelected) background = pressable(Color.TRANSPARENT, accent, 15)
             }
             periods.addView(control, lp(0, -2, 1f))
         }
@@ -1059,7 +1122,7 @@ class MainActivity : ComponentActivity() {
             note(detail, if (day == null && readIssue == null) "Loading readings…" else "No readings for this day", 4)
         }
         if (value != null) {
-            detail.addView(readout(number(value), metric.unit))
+            detail.addView(readout(number(value), metric.unit, accent = accent))
             note(detail, if (metric.isTotal) "Daily total" else "Daily average", 3)
             plot(detail, dayPoints(day.buckets(metric)), metric,
                 if (metric.isTotal) "3-hour totals" else "3-hour averages", 16, caption = true)
@@ -1078,7 +1141,9 @@ class MainActivity : ComponentActivity() {
         if (value == null) {
             note(panel, if (series == null && readIssue == null) "Loading readings…" else "No readings for this period", 4)
         } else {
-            panel.addView(if (metric == null) readout(duration(value.toInt())) else readout(number(value), metric.unit))
+            val accent = palette.metric(metric)
+            panel.addView(if (metric == null) readout(duration(value.toInt()), accent = accent)
+                else readout(number(value), metric.unit, accent = accent))
             note(panel, if (total) "Period total" else "Period average", 3)
             val byMonth = period == HistoryPeriod.YEAR
             val points = dates.mapIndexed { index, date ->
@@ -1111,7 +1176,7 @@ class MainActivity : ComponentActivity() {
         }
         if (caption) note(parent, title, top)
         val description = if (openPoint == null) "$title. " + points.joinToString(". ", transform = ::description) else null
-        val chart = BarChart(this, palette, points, description, durationAxis = metric == null)
+        val chart = BarChart(this, palette, points, description, palette.metric(metric), durationAxis = metric == null)
         val frame = FrameLayout(this)
         frame.addView(chart, FrameLayout.LayoutParams(-1, -1))
         if (openPoint != null) {
@@ -1130,7 +1195,8 @@ class MainActivity : ComponentActivity() {
         block(parent, frame, if (caption) 8 else top, dp(height))
     }
 
-    private fun sleepPanel(night: SleepNight?, historyLink: LocalDate? = null) = panel().apply {
+    private fun sleepPanel(night: SleepNight?, historyLink: LocalDate? = null) = panel(radius = 22).apply {
+        background = accentSurface(palette, palette.sleep, 22)
         if (historyLink != null) {
             addView(summaryRow("Sleep", Glyph.MOON, null, showMissing = false) {
                 openHistory(null, historyLink)
@@ -1140,10 +1206,10 @@ class MainActivity : ComponentActivity() {
             note(this, if (currentDay == null && readIssue == null) "Loading sleep…" else "No sleep recorded", 4)
             return@apply
         }
-        addView(readout(duration(night.asleepMinutes)), lp(-1, -2))
+        addView(readout(duration(night.asleepMinutes), accent = palette.sleep), lp(-1, -2))
         val start = LocalTime.ofSecondOfDay(night.startMinute * 60L)
         note(this, "Sleep began at ${TIME.format(start)}", 5)
-        block(this, SleepTimeline(this@MainActivity, palette, night.segments), 18, dp(20))
+        block(this, SleepTimeline(this@MainActivity, palette, night.segments), 18, dp(26))
         for (stage in SleepStage.entries) {
             val minutes = night.segments.filter { it.stage == stage }.sumOf { it.minutes }
             if (minutes == 0) continue
@@ -1160,6 +1226,7 @@ class MainActivity : ComponentActivity() {
         currentDay = null
         trend = null
         drawScreen()
+        animateIn(content, y = dp(8), duration = 200)
         loadData()
     }
 
@@ -1209,7 +1276,7 @@ class MainActivity : ComponentActivity() {
                         val dayNumber = cell - offset + 1
                         val date = if (dayNumber in 1..month.lengthOfMonth()) month.atDay(dayNumber) else null
                         val view = if (date == null) View(this@MainActivity) else label(number(dayNumber.toLong()),
-                            15, if (date == day) palette.onBrand else if (date > today) palette.muted else palette.ink).apply {
+                            15, if (date == day) palette.onAccent else if (date > today) palette.muted else palette.ink).apply {
                             gravity = Gravity.CENTER
                             background = pressable(if (date == day) palette.brand else Color.TRANSPARENT, palette.ink, 12)
                             contentDescription = date.format(fullDate)
@@ -1238,13 +1305,24 @@ class MainActivity : ComponentActivity() {
         val current = state.connecting ?: state.device
         val connected = state.connection == Connection.CONNECTED
         val idle = state.action == BandAction.IDLE
-        val devicePanel = panel()
+        val devicePanel = panel(radius = 26).apply { background = accentSurface(palette, palette.brand, 26) }
         val identity = row()
-        identity.addView(Icon(this, Glyph.BAND, palette.brand), lp(dp(48), dp(48)))
         val words = column()
-        words.addView(label(current?.name ?: "Connect a band", 23, palette.ink, "sans-serif-medium"))
-        if (current != null) note(words, connectionText(state), 4)
-        identity.addView(words, lp(0, -2, 1f).apply { marginStart = dp(13) })
+        words.addView(label(current?.name ?: "Connect a band", 31, palette.ink, "sans-serif-medium").apply {
+            letterSpacing = -.035f
+            if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+        })
+        if (current != null) {
+            val color = when (state.connection) {
+                Connection.CONNECTED -> palette.brand
+                Connection.CONNECTING -> palette.oxygen
+                Connection.DISCONNECTED -> palette.muted
+            }
+            block(words, label(connectionText(state), 14, color, "sans-serif-medium"), 4)
+        }
+        identity.addView(words, lp(0, -2, 1f).apply { marginEnd = dp(10) })
+        identity.addView(iconBadge(Glyph.BAND, palette.brand, filled = true, glyphSize = 31),
+            lp(dp(60), dp(60)))
         devicePanel.addView(identity, lp(-1, -2))
         state.battery?.let {
             val batteryLine = row()
@@ -1280,24 +1358,30 @@ class MainActivity : ComponentActivity() {
             Connection.CONNECTING -> addButton(devicePanel, "Cancel", filled = false, top = 16) { band.disconnect() }
             Connection.CONNECTED -> addButton(devicePanel, "Sync now", enabled = idle, top = 16) { band.importHistory(false) }
         }
-        block(page, devicePanel, 10)
+        block(page, devicePanel, 0)
         app.storageIssue?.let { note(page, it, 12, true) }
+        if (state.connection == Connection.DISCONNECTED) nearbyBands(page, state)
 
         heading(page, "Tools", 24)
-        val tools = panel()
-        actionRow(tools, "Phone clock", Glyph.CLOCK, true) { go(Tab.CLOCK) }
-        if (phoneCameraAvailable()) actionRow(tools, "Camera remote", Glyph.CAMERA, true, action = ::openCamera)
+        val tools = mutableListOf(featureTile("Phone clock", Glyph.CLOCK) { go(Tab.CLOCK) })
+        if (phoneCameraAvailable()) tools.add(featureTile("Camera remote", Glyph.CAMERA, action = ::openCamera))
+        tileRows(page, tools, 9)
         if (connected) {
-            actionRow(tools, "Find band", Glyph.SCAN, idle) { band.findBand() }
+            val find = panel()
+            actionRow(find, "Find band", Glyph.SCAN, idle) { band.findBand() }
+            block(page, find, 9)
         }
-        actionRow(tools, "Phone vibration", Glyph.PHONE, true) { go(Tab.VIBRATION) }
+
+        heading(page, "Alerts", 24)
+        val alerts = panel()
+        actionRow(alerts, "Phone vibration", Glyph.PHONE, true) { go(Tab.VIBRATION) }
         if (state.device != null || app.callAlertsRunning) {
-            actionRow(tools, if (app.callAlertsRunning) "Turn off band call alerts" else "Turn on band call alerts",
+            actionRow(alerts, if (app.callAlertsRunning) "Turn off band call alerts" else "Turn on band call alerts",
                 Glyph.PHONE, true) { toggleCallAlerts() }
-            if (connected) actionRow(tools, "Test band call alert", Glyph.PHONE, idle) { band.testCallAlert() }
-            app.callAlertsIssue?.let { note(tools, it, 7, true) }
+            if (connected) actionRow(alerts, "Test band call alert", Glyph.PHONE, idle) { band.testCallAlert() }
+            app.callAlertsIssue?.let { note(alerts, it, 7, true) }
         }
-        block(page, tools, 9)
+        block(page, alerts, 9)
 
         if (connected) {
             heading(page, "Settings", 25)
@@ -1326,38 +1410,40 @@ class MainActivity : ComponentActivity() {
             }
             actionRow(actions, "Disconnect", Glyph.BLUETOOTH, true) { band.disconnect() }
             block(page, actions, 9)
-        } else if (state.connection == Connection.DISCONNECTED) {
-            if (state.device != null || state.scanning || state.searched || state.nearby.isNotEmpty()) {
-                heading(page, "Nearby bands", 25)
-                val nearby = panel()
-                if (state.device != null) actionRow(nearby, if (state.scanning) "Stop scan" else "Scan for bands",
-                    Glyph.SCAN, true) { if (state.scanning) band.stopScan() else bluetooth(PermissionAction.SCAN) }
-                if (state.scanning) note(nearby, "Scanning…", if (nearby.childCount == 0) 3 else 9)
-                else if (state.searched && state.nearby.isEmpty() && state.message == null) {
-                    note(nearby, "No bands found. Disconnect the band from other apps and scan again.", 3)
-                }
-                for (candidate in state.nearby) {
-                    actionRow(nearby, candidate.name, Glyph.BAND, true, candidate.address) { band.connect(candidate) }
-                }
-                if (nearby.childCount > 0) block(page, nearby, 9)
-            }
-            if (state.device != null && !state.scanning) {
-                addButton(page, "Forget band", filled = false, top = 18) {
-                    showPopup("Forget this band?") { dialog ->
-                        note(this, "Readings stay on this phone.", 2)
-                        popupActions(this, dialog, "Forget") {
-                            dialog.dismiss()
-                            stopService(Intent(this@MainActivity, CallRelayService::class.java))
-                            band.forget()
-                        }
-                    }
-                }
-            }
         }
         heading(page, "Data", 24)
         val data = panel()
         actionRow(data, "Backup", Glyph.BACKUP, true) { go(Tab.BACKUP) }
         block(page, data, 9)
+        if (state.connection == Connection.DISCONNECTED && state.device != null && !state.scanning) {
+            addButton(page, "Forget band", filled = false, top = 18) {
+                showPopup("Forget this band?") { dialog ->
+                    note(this, "Readings stay on this phone.", 2)
+                    popupActions(this, dialog, "Forget") {
+                        dialog.dismiss()
+                        stopService(Intent(this@MainActivity, CallRelayService::class.java))
+                        band.forget()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun nearbyBands(page: LinearLayout, state: BandState) {
+        val nearby = panel()
+        if (state.device != null) actionRow(nearby, if (state.scanning) "Stop scan" else "Scan for bands",
+            Glyph.SCAN, true) { if (state.scanning) band.stopScan() else bluetooth(PermissionAction.SCAN) }
+        if (state.scanning) note(nearby, "Scanning…", if (nearby.childCount == 0) 3 else 9)
+        else if (state.searched && state.nearby.isEmpty() && state.message == null) {
+            note(nearby, "No bands found. Disconnect the band from other apps and scan again.", 3)
+        }
+        for (candidate in state.nearby) {
+            actionRow(nearby, candidate.name, Glyph.BAND, true, candidate.address) { band.connect(candidate) }
+        }
+        if (nearby.childCount > 0) {
+            heading(page, "Nearby bands", 24)
+            block(page, nearby, 9)
+        }
     }
 
     private fun vibrationPage(page: LinearLayout) {
@@ -1384,28 +1470,50 @@ class MainActivity : ComponentActivity() {
             }
         } else {
             val launchable = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            val names = packageManager.queryIntentActivities(launchable, 0)
+            val installed = packageManager.queryIntentActivities(launchable, 0)
                 .asSequence().map { it.activityInfo.applicationInfo }.distinctBy { it.packageName }
                 .filter { it.packageName != packageName }.map {
-                    it.packageName to it.loadLabel(packageManager).toString()
+                    it to it.loadLabel(packageManager).toString()
                 }.toList().sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.second })
-            val selected = vibration.apps
-            for ((id, name) in names) {
-                if (apps.isNotEmpty()) divider(apps)
-                vibrationSwitch(apps, name, id in selected) { vibration.setApp(id, it) }
+            if (installed.isEmpty()) {
+                note(apps, "No apps to show.", 5)
+            } else {
+                fun showApps(query: String) {
+                    apps.removeAllViews()
+                    val selected = vibration.apps
+                    for ((info, name) in installed) {
+                        if (!name.contains(query, ignoreCase = true)) continue
+                        if (apps.isNotEmpty()) divider(apps)
+                        vibrationSwitch(apps, name, info.packageName in selected, info.loadIcon(packageManager)) {
+                            vibration.setApp(info.packageName, it)
+                        }
+                    }
+                    if (apps.childCount == 0) note(apps, "No matching apps", 5)
+                }
+                val search = popupInput("Search apps", InputType.TYPE_CLASS_TEXT).apply {
+                    doAfterTextChanged { showApps(it.toString().trim()) }
+                }
+                block(page, search, 8)
+                showApps("")
             }
-            if (names.isEmpty()) note(apps, "No apps to show.", 5)
         }
         block(page, apps, 9)
     }
 
-    private fun vibrationSwitch(parent: LinearLayout, title: String, checked: Boolean, change: (Boolean) -> Unit) {
+    private fun vibrationSwitch(
+        parent: LinearLayout, title: String, checked: Boolean, icon: Drawable? = null, change: (Boolean) -> Unit
+    ) {
         block(parent, Switch(this).apply {
             text = title
             textSize = 16f
             setTextColor(palette.ink)
             minHeight = dp(52)
             switchPadding = dp(12)
+            if (icon != null) {
+                icon.setBounds(0, 0, dp(27), dp(27))
+                setCompoundDrawablesRelative(icon, null, null, null)
+                compoundDrawablePadding = dp(11)
+            }
             val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
             thumbTintList = ColorStateList(states, intArrayOf(palette.brand, palette.muted))
             trackTintList = ColorStateList(states, intArrayOf(
@@ -1482,11 +1590,11 @@ class MainActivity : ComponentActivity() {
             clipToOutline = true
         }
         val status = label("", 14, palette.muted).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
-        val take = button("Take photo", filled = true) {}
-        val retry = button("Retry band shutter", filled = false) {}
+        val take = button("Take photo", filled = true, accent = palette.calories) {}
+        val retry = button("Retry band shutter", filled = false, accent = palette.calories) {}
         val settings = row()
-        val timer = button("Timer off", filled = false) {}
-        val lens = button("Switch camera", filled = false) {}
+        val timer = button("Timer off", filled = false, accent = palette.calories) {}
+        val lens = button("Switch camera", filled = false, accent = palette.calories) {}
         settings.addView(timer, lp(0, -2, 1f))
         settings.addView(lens, lp(0, -2, 1f).apply { marginStart = dp(8) })
         val controls = if (expanded) column() else screen
@@ -1507,11 +1615,15 @@ class MainActivity : ComponentActivity() {
         camera = BandCamera(this, band, preview, status, take, retry, timer, lens).also { it.resume(resumed) }
     }
 
-    private fun clockScreen() {
+    private fun clockScreen(animateFace: Boolean = false) {
         val digital = displayPrefs.getBoolean("digitalClock", true)
         val screen = column().apply { setPadding(dp(18), dp(10), dp(18), dp(20)) }
         pageHeader(screen)
-        val face = panel().apply { gravity = Gravity.CENTER_HORIZONTAL; setPadding(dp(12), dp(26), dp(12), dp(26)) }
+        val face = panel(radius = 26).apply {
+            background = accentSurface(palette, palette.sleep, 26)
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(12), dp(26), dp(12), dp(26))
+        }
         val time = TextClock(this).apply {
             format12Hour = "h:mm a"
             format24Hour = "HH:mm"
@@ -1521,7 +1633,7 @@ class MainActivity : ComponentActivity() {
             fontFeatureSettings = "'tnum'"
             letterSpacing = -.035f
             gravity = Gravity.CENTER
-            setTextColor(palette.brand)
+            setTextColor(palette.sleep)
         }
         if (!digital) face.addView(AnalogFace(this, palette), lp(dp(200), dp(200)))
         block(face, time, if (digital) 0 else 12)
@@ -1536,15 +1648,18 @@ class MainActivity : ComponentActivity() {
         val styles = row()
         for ((name, choice) in listOf("Digital" to true, "Analog" to false)) {
             val selected = digital == choice
-            styles.addView(button(name, filled = selected) {
-                displayPrefs.edit { putBoolean("digitalClock", choice) }
-                clockScreen()
+            styles.addView(button(name, filled = selected, accent = palette.sleep) {
+                if (!selected) {
+                    displayPrefs.edit { putBoolean("digitalClock", choice) }
+                    clockScreen(animateFace = true)
+                }
             }.apply { isSelected = selected }, lp(0, -2, 1f).apply { if (!choice) marginStart = dp(8) })
         }
         block(screen, styles, 9)
         scroll = ScrollView(this).apply { addView(screen); isFillViewport = true }
         content.removeAllViews()
         content.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+        if (animateFace) animateIn(face, y = dp(6), duration = 200)
     }
 
     private fun detailsDialog(configured: Boolean) {
@@ -1568,16 +1683,17 @@ class MainActivity : ComponentActivity() {
     private fun actionRow(parent: LinearLayout, title: String, glyph: Glyph, enabled: Boolean,
                           detail: String? = null, action: () -> Unit) {
         if (parent.childCount > 0) divider(parent)
+        val accent = palette.glyph(glyph)
         val line = row().apply {
             minimumHeight = dp(52)
             setPadding(0, dp(8), 0, dp(8))
-            background = pressable(Color.TRANSPARENT, palette.brand, 10)
+            background = pressable(Color.TRANSPARENT, accent, 11)
             isEnabled = enabled
             isFocusable = enabled
             contentDescription = if (detail == null) title else "$title, $detail"
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
             if (enabled) setOnClickListener { action() }
-            addView(Icon(this@MainActivity, glyph, if (enabled) palette.brand else palette.muted), lp(dp(22), dp(22)))
+            addView(iconBadge(glyph, if (enabled) accent else palette.muted, filled = enabled), lp(dp(34), dp(34)))
             val words = column().apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS }
             words.addView(label(title, 16, if (enabled) palette.ink else palette.muted, "sans-serif-medium"))
             detail?.let { note(words, it, 3) }
@@ -1589,8 +1705,8 @@ class MainActivity : ComponentActivity() {
 
     private fun backupPage(page: LinearLayout) {
         val backup = app.settings.state()
-        val status = panel()
-        section(status, Glyph.BACKUP, "Home server", palette.brand)
+        val status = panel(radius = 24).apply { background = accentSurface(palette, palette.workout, 24) }
+        section(status, Glyph.BACKUP, "Home server", palette.workout)
         if (backup.endpoint == null) {
             note(status, "Connect your server to back up and restore your readings.", 9)
             addButton(status, "Set up backup", top = 14) { backupDialog(null) }
@@ -1697,7 +1813,7 @@ class MainActivity : ComponentActivity() {
                     isSelected = choice.selected
                     isFocusable = true
                     contentDescription = choice.title
-                    addView(iconBadge(choice.icon, palette.brand), lp(dp(32), dp(32)))
+                    addView(iconBadge(choice.icon, palette.glyph(choice.icon), filled = true), lp(dp(32), dp(32)))
                     addView(label(choice.title, 16, palette.ink, "sans-serif-medium").ignoreAccessibility(),
                         lp(0, -2, 1f).apply { marginStart = dp(11) })
                     if (choice.selected) addView(Icon(this@MainActivity, Glyph.CHECK, palette.brand),
@@ -1721,14 +1837,13 @@ class MainActivity : ComponentActivity() {
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         val body = column().apply {
             isFocusableInTouchMode = true
-            setPadding(dp(18), dp(19), dp(18), dp(15))
-            block(this, label(title, 23, palette.ink, "sans-serif-medium").apply {
+            setPadding(dp(20), dp(22), dp(20), dp(18))
+            block(this, label(title, 25, palette.ink, "sans-serif-medium").apply {
                 if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
             }, 0)
-            block(this, View(this@MainActivity).apply { setBackgroundColor(palette.border) }, 13, dp(1))
             val fields = column()
             fields.fill(dialog)
-            block(this, fields, 11)
+            block(this, fields, 18)
         }
         dialog.setContentView(ScrollView(this).apply {
             background = shape(palette.surface, 26, palette.border)
@@ -1749,6 +1864,7 @@ class MainActivity : ComponentActivity() {
         body.requestFocus()
         dialog.show()
         dialog.window?.setLayout(dp((resources.configuration.screenWidthDp - 24).coerceIn(1, 430)), -2)
+        animateIn(body, y = dp(10), duration = 210)
     }
 
     private fun popupActions(parent: LinearLayout, dialog: Dialog, title: String, confirm: (Button) -> Unit) {
@@ -1807,8 +1923,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun readout(value: String, unit: String = "", size: Int = 43): TextView =
-        label(value, size, palette.ink, "sans-serif-medium").apply {
+    private fun readout(value: String, unit: String = "", size: Int = 43, accent: Int = palette.ink): TextView =
+        label(value, size, accent, "sans-serif-medium").apply {
             letterSpacing = -.038f
             text = readoutText(value, unit)
         }
@@ -1825,29 +1941,89 @@ class MainActivity : ComponentActivity() {
         val bar = row()
         val parent = backDestination()
         bar.addView(iconButton(Glyph.LEFT, "Back to ${parent.title}", true) { go(parent) }, lp(dp(48), dp(48)))
-        bar.addView(label(tab.title, 24, palette.ink, "sans-serif-medium").apply {
+        bar.addView(label(tab.title, 29, palette.ink, "sans-serif-medium").apply {
+            letterSpacing = -.033f
             if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
-        }, lp(0, -2, 1f))
+        }, lp(0, -2, 1f).apply { marginStart = dp(8) })
         block(page, bar, 0)
     }
 
-    private fun sectionHeader(page: LinearLayout, title: String, action: String, top: Int, trailing: View? = null, open: () -> Unit) {
+    private fun sectionHeader(
+        page: LinearLayout, title: String, action: String, top: Int, trailing: View? = null,
+        display: Boolean = false, open: () -> Unit
+    ) {
         val header = row()
-        header.addView(label(title, 22, palette.ink, "sans-serif-medium").apply {
+        header.addView(label(title, if (display) 36 else 22, palette.ink, "sans-serif-medium").apply {
             letterSpacing = -.025f
             if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
         }, lp(0, -2, 1f))
         header.addView(button(action, filled = false, action = open).apply {
-            background = pressable(Color.TRANSPARENT, palette.brand, 12)
-            setPadding(dp(11), dp(6), 0, dp(6))
+            background = pressable(if (display) palette.container(palette.brand) else Color.TRANSPARENT, palette.brand, 15)
+            setPadding(dp(12), dp(6), dp(if (display) 12 else 0), dp(6))
         }, lp(-2, -2))
         trailing?.let { header.addView(it, lp(dp(48), dp(48)).apply { marginStart = dp(8) }) }
         block(page, header, top)
     }
 
-    private fun iconBadge(icon: Glyph, accent: Int) = FrameLayout(this).apply {
-        background = shape(ColorUtils.blendARGB(palette.surface, accent, .17f), 12)
-        addView(Icon(this@MainActivity, icon, accent), FrameLayout.LayoutParams(dp(19), dp(19), Gravity.CENTER))
+    private fun iconBadge(icon: Glyph, accent: Int, filled: Boolean = false, glyphSize: Int = 19) =
+        FrameLayout(this).apply {
+            background = shape(if (filled) accent else palette.container(accent), if (glyphSize > 24) 18 else 11)
+            addView(Icon(this@MainActivity, icon, if (filled) palette.onAccent else accent),
+                FrameLayout.LayoutParams(dp(glyphSize), dp(glyphSize), Gravity.CENTER))
+        }
+
+    private fun heroAction(title: String, glyph: Glyph, accent: Int, enabled: Boolean = true, action: () -> Unit) =
+        row().apply {
+            val fill = if (enabled) accent else palette.tint
+            val ink = if (enabled) palette.onAccent else palette.muted
+            minimumHeight = dp(122)
+            setPadding(dp(19), dp(16), dp(16), dp(16))
+            background = pressable(fill, ink, 26)
+            this.isEnabled = enabled
+            isFocusable = enabled
+            contentDescription = title
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+            if (enabled) setOnClickListener { action() }
+            addView(label(title, 33, ink, "sans-serif-medium").apply { letterSpacing = -.035f }.ignoreAccessibility(),
+                lp(0, -2, 1f))
+            val emblem = FrameLayout(this@MainActivity).apply {
+                background = shape(ColorUtils.blendARGB(fill, ink, .13f), 23)
+                addView(Icon(this@MainActivity, glyph, ink), FrameLayout.LayoutParams(dp(39), dp(39), Gravity.CENTER))
+            }
+            addView(emblem, lp(dp(70), dp(70)).apply { marginStart = dp(9) })
+        }
+
+    private fun featureTile(title: String, glyph: Glyph, enabled: Boolean = true, action: () -> Unit) = column().apply {
+        val accent = if (enabled) palette.glyph(glyph) else palette.muted
+        setPadding(dp(14), dp(13), dp(14), dp(13))
+        minimumHeight = dp(90)
+        background = pressable(accentSurface(palette, accent, 20), accent, 20)
+        isEnabled = enabled
+        isFocusable = enabled
+        contentDescription = title
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        if (enabled) setOnClickListener { action() }
+        val tools = row()
+        tools.addView(iconBadge(glyph, accent, filled = enabled), lp(dp(33), dp(33)))
+        tools.addView(View(this@MainActivity), lp(0, 1, 1f))
+        tools.addView(Icon(this@MainActivity, Glyph.RIGHT, accent), lp(dp(15), dp(15)))
+        addView(tools, lp(-1, -2))
+        block(this, label(title, 16, if (enabled) palette.ink else palette.muted, "sans-serif-medium").ignoreAccessibility(), 8)
+    }
+
+    private fun stackTiles() = resources.configuration.let {
+        it.screenWidthDp < 360 || (it.screenWidthDp < 560 && it.fontScale > 1.2f)
+    }
+
+    private fun tileRows(page: LinearLayout, tiles: List<View>, top: Int) {
+        val columns = if (stackTiles()) 1 else 2
+        for ((index, group) in tiles.chunked(columns).withIndex()) {
+            val line = row()
+            group.forEachIndexed { cell, tile ->
+                line.addView(tile, lp(0, -1, 1f).apply { if (cell != 0) marginStart = dp(9) })
+            }
+            block(page, line, if (index == 0) top else 9)
+        }
     }
 
     private fun TextView.ignoreAccessibility() = apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }
@@ -1863,7 +2039,7 @@ class MainActivity : ComponentActivity() {
 
     private fun section(panel: LinearLayout, glyph: Glyph, text: String, accent: Int) {
         val header = row()
-        header.addView(Icon(this, glyph, accent), lp(dp(22), dp(22)))
+        header.addView(iconBadge(glyph, accent, filled = true), lp(dp(34), dp(34)))
         header.addView(label(text, 18, palette.ink, "sans-serif-medium").apply { if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true },
             lp(0, -2, 1f).apply { marginStart = dp(9) })
         panel.addView(header, lp(-1, -2))
@@ -1872,14 +2048,14 @@ class MainActivity : ComponentActivity() {
     private fun note(parent: LinearLayout, text: String, top: Int, warning: Boolean = false) =
         block(parent, label(text, 14, if (warning) palette.warning else palette.muted).apply { setLineSpacing(dp(2).toFloat(), 1f) }, top)
 
-    private fun panel() = column().apply {
-        background = shape(palette.surface, 15)
-        setPadding(dp(15), dp(9), dp(15), dp(9))
+    private fun panel(radius: Int = 18) = column().apply {
+        background = shape(palette.surface, radius)
+        setPadding(dp(15), dp(10), dp(15), dp(10))
     }
 
     private fun iconButton(glyph: Glyph, description: String, enabled: Boolean, action: () -> Unit): FrameLayout {
         return FrameLayout(this).apply {
-            background = pressable(Color.TRANSPARENT, palette.ink, 12)
+            background = pressable(if (enabled) palette.tint else Color.TRANSPARENT, palette.ink, 15)
             isEnabled = enabled
             isFocusable = enabled
             contentDescription = description
@@ -1891,10 +2067,12 @@ class MainActivity : ComponentActivity() {
 
     private fun addButton(parent: LinearLayout, text: String, enabled: Boolean = true,
                           filled: Boolean = true, top: Int, action: () -> Unit) {
-        block(parent, button(text, filled, enabled, action), top)
+        block(parent, button(text, filled, enabled, action = action), top)
     }
 
-    private fun button(title: String, filled: Boolean, enabled: Boolean = true, action: () -> Unit) = Button(this).apply {
+    private fun button(
+        title: String, filled: Boolean, enabled: Boolean = true, accent: Int = palette.brand, action: () -> Unit
+    ) = Button(this).apply {
         text = title
         isAllCaps = false
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -1904,8 +2082,8 @@ class MainActivity : ComponentActivity() {
         minWidth = 0
         gravity = Gravity.CENTER
         stateListAnimator = null
-        val bg = if (filled) palette.brand else palette.surface
-        val fg = if (filled) palette.onBrand else palette.brand
+        val bg = if (filled) accent else palette.container(accent)
+        val fg = if (filled) palette.onAccent else accent
         val disabled = intArrayOf(-android.R.attr.state_enabled)
         background = android.graphics.drawable.StateListDrawable().apply {
             addState(disabled, shape(palette.background, 13, palette.border))
@@ -1946,6 +2124,7 @@ class MainActivity : ComponentActivity() {
     private fun dateTime(time: Long, zone: ZoneId) = DATE_TIME.format(Instant.ofEpochMilli(time).atZone(zone))
 
     companion object {
+        private val screenEasing = DecelerateInterpolator(1.8f)
         private val DAILY_TABS = setOf(Tab.TODAY, Tab.HEALTH)
         private val HEALTH_METRICS = listOf(Metric.HEART, Metric.OXYGEN, Metric.HRV, Metric.STRESS)
         private val SHORT_DATE = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)

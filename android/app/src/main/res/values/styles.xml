@@ -1,8 +1,8 @@
 <resources>
     <string name="app_name">OpenHK50</string>
     <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">#F0F4F0</item>
-        <item name="android:colorAccent">#136044</item>
+        <item name="android:windowBackground">#F3F2FB</item>
+        <item name="android:colorAccent">#006949</item>
         <item name="android:windowActionModeOverlay">true</item>
     </style>
 </resources>

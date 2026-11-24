@@ -5,39 +5,81 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
 import android.view.View
+import androidx.core.graphics.ColorUtils
 import org.openhk50.data.Metric
 import org.openhk50.data.SleepSegment
 import org.openhk50.data.SleepStage
+import org.openhk50.data.WorkoutType
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 internal data class Palette(
     val background: Int, val surface: Int, val ink: Int, val muted: Int, val border: Int,
-    val tint: Int, val chart: Int, val night: Boolean
+    val tint: Int, val night: Boolean
 ) {
-    val brand get() = if (night) 0xffb8f6ce.toInt() else 0xff136044.toInt()
-    val onBrand get() = if (night) 0xff10251a.toInt() else Color.WHITE
-    val warning get() = if (night) 0xffffba99.toInt() else 0xff8b3d23.toInt()
-    val calories get() = if (night) 0xffffa584.toInt() else 0xffa33f27.toInt()
-    val workout get() = if (night) 0xffbda9ff.toInt() else 0xff5f409d.toInt()
+    val brand get() = accent(0xff6ff5bd, 0xff006949)
+    val warning get() = calories
+    val calories get() = accent(0xffffac74, 0xff984019)
+    val workout get() = accent(0xffc2a7ff, 0xff6543ad)
     val steps get() = brand
-    val sleep get() = if (night) 0xff91c7fc.toInt() else 0xff245c8f.toInt()
+    val sleep get() = accent(0xff8bb7ff, 0xff2f59a8)
+    val heart get() = accent(0xffff8daa, 0xffa52750)
+    val oxygen get() = accent(0xff63e4ef, 0xff006770)
+    val stress get() = accent(0xffffd476, 0xff805406)
+
+    private fun accent(dark: Long, light: Long) = (if (night) dark else light).toInt()
+
+    val onAccent get() = if (night) 0xff141021.toInt() else Color.WHITE
+    fun container(accent: Int) = ColorUtils.blendARGB(surface, accent, if (night) .18f else .09f)
+    fun metric(metric: Metric?) = when (metric) {
+        Metric.HEART -> heart
+        Metric.OXYGEN -> oxygen
+        Metric.STRESS -> stress
+        Metric.HRV -> workout
+        Metric.CALORIES -> calories
+        Metric.DISTANCE -> oxygen
+        Metric.STEPS -> steps
+        null -> sleep
+    }
+
+    fun glyph(glyph: Glyph) = when (glyph) {
+        Glyph.PULSE, Glyph.PHONE -> heart
+        Glyph.WALK, Glyph.RUN, Glyph.STRENGTH, Glyph.VARIABILITY, Glyph.BACKUP -> workout
+        Glyph.CYCLE, Glyph.DROP, Glyph.BLUETOOTH -> oxygen
+        Glyph.HIKE, Glyph.TODAY, Glyph.STEPS, Glyph.SCAN, Glyph.BAND, Glyph.BATTERY -> brand
+        Glyph.CLOCK, Glyph.MOON, Glyph.CALENDAR -> sleep
+        Glyph.FLAME, Glyph.HIIT, Glyph.CAMERA -> calories
+        Glyph.WAVE, Glyph.YOGA -> stress
+        else -> brand
+    }
 
     companion object {
         fun of(night: Boolean) = if (night) Palette(
-            color("#090B0A"), color("#181C1A"), color("#F5F7F5"), color("#ADB7B1"),
-            color("#343C37"), color("#242D27"), color("#B8F6CE"), true
+            color("#10101B"), color("#1C1D30"), color("#F8F5FF"), color("#BCC0D9"),
+            color("#3B3D57"), color("#292A43"), true
         ) else Palette(
-            color("#F0F4F0"), Color.WHITE, color("#14211A"), color("#4E6056"),
-            color("#D6DED8"), color("#E1EDE5"), color("#136044"), false
+            color("#F3F2FB"), Color.WHITE, color("#1A1B31"), color("#4F546C"),
+            color("#D9DBED"), color("#E8E8F6"), false
         )
 
         private fun color(hex: String) = Color.parseColor(hex)
     }
+}
+
+internal val WorkoutType.icon get() = when (this) {
+    WorkoutType.WALK -> Glyph.STEPS
+    WorkoutType.RUN -> Glyph.RUN
+    WorkoutType.CYCLE -> Glyph.CYCLE
+    WorkoutType.HIKE -> Glyph.HIKE
+    WorkoutType.HIIT -> Glyph.HIIT
+    WorkoutType.STRENGTH -> Glyph.STRENGTH
+    WorkoutType.YOGA -> Glyph.YOGA
+    WorkoutType.OTHER -> Glyph.WALK
 }
 
 internal val Metric.title get() = when (this) {
@@ -94,11 +136,11 @@ internal fun Context.shape(color: Int, radius: Int, stroke: Int? = null) = Gradi
 
 internal fun Context.navigationGlass(palette: Palette, radius: Int, selected: Boolean = false): GradientDrawable {
     val colors = if (selected) {
-        if (palette.night) intArrayOf(0xff395347.toInt(), 0xff25392f.toInt())
-        else intArrayOf(0xffedf9f1.toInt(), 0xffd5eadc.toInt())
+        if (palette.night) intArrayOf(0xff34594f.toInt(), 0xff243944.toInt())
+        else intArrayOf(0xffe0fff1.toInt(), 0xffd7efe9.toInt())
     } else {
-        if (palette.night) intArrayOf(0xee283a33.toInt(), 0xe116231e.toInt())
-        else intArrayOf(0xf8ffffff.toInt(), 0xe7e4f0e8.toInt())
+        if (palette.night) intArrayOf(0xf02b3e43.toInt(), 0xee202335.toInt())
+        else intArrayOf(0xfaffffff.toInt(), 0xebe1f2ef.toInt())
     }
     val rim = if (palette.night) 0x4ddef6e7 else 0xfaffffff.toInt()
     return GradientDrawable(GradientDrawable.Orientation.TL_BR, colors).apply {
@@ -107,14 +149,23 @@ internal fun Context.navigationGlass(palette: Palette, radius: Int, selected: Bo
     }
 }
 
-internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = null) = RippleDrawable(
-    ColorStateList.valueOf((ink and 0x00ffffff) or 0x22000000),
-    shape(fill, radius, stroke), shape(Color.WHITE, radius)
+internal fun Context.accentSurface(palette: Palette, accent: Int, radius: Int = 24) =
+    GradientDrawable(GradientDrawable.Orientation.TR_BL, intArrayOf(
+        ColorUtils.blendARGB(palette.surface, accent, if (palette.night) .25f else .14f),
+        palette.container(accent)
+    )).apply { cornerRadius = dp(radius).toFloat() }
+
+internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = null) =
+    pressable(shape(fill, radius, stroke), ink, radius)
+
+internal fun Context.pressable(fill: Drawable, ink: Int, radius: Int) = RippleDrawable(
+    ColorStateList.valueOf(ColorUtils.setAlphaComponent(ink, 38)), fill, shape(Color.WHITE, radius)
 )
 
 internal enum class Glyph {
     PULSE, CALENDAR, BAND, BACKUP, WALK, BATTERY, LEFT, RIGHT, DOWN, BLUETOOTH, CHECK, CLOCK,
-    DROP, WAVE, VARIABILITY, SCAN, MOON, TODAY, CAMERA, PHONE, STEPS, FLAME
+    DROP, WAVE, VARIABILITY, SCAN, MOON, TODAY, CAMERA, PHONE, STEPS, FLAME,
+    RUN, CYCLE, HIKE, HIIT, STRENGTH, YOGA
 }
 
 internal class Icon(context: Context, private val glyph: Glyph, private val color: Int) : View(context) {
@@ -199,6 +250,36 @@ internal class Icon(context: Context, private val glyph: Glyph, private val colo
                 path(13f, 9f, 11f, 15f, 15f, 17f, 17f, 22f)
                 path(11f, 15f, 9f, 19f, 5f, 21f)
             }
+            Glyph.RUN -> {
+                canvas.drawCircle(16f, 4.5f, 1.8f, paint)
+                path(7f, 10f, 11f, 7.5f, 14.5f, 9f, 18f, 12.5f, 21f, 11f)
+                path(14.5f, 9f, 11f, 14f, 16f, 16f, 19f, 21f)
+                path(11f, 14f, 8f, 18f, 3f, 19f)
+            }
+            Glyph.CYCLE -> {
+                canvas.drawCircle(5.5f, 16f, 3.5f, paint)
+                canvas.drawCircle(18.5f, 16f, 3.5f, paint)
+                path(5.5f, 16f, 9f, 10f, 15f, 10f, 12f, 16f, 5.5f, 16f)
+                path(18.5f, 16f, 15f, 6f, 18f, 6f)
+                path(7f, 8f, 11f, 8f)
+            }
+            Glyph.HIKE -> {
+                path(2f, 19f, 9f, 7f, 14f, 15f, 17.5f, 10f, 22f, 19f, 2f, 19f)
+                path(7.5f, 11f, 9f, 13f, 10.5f, 11f)
+            }
+            Glyph.HIIT -> path(14f, 2.5f, 5f, 14f, 11f, 14f, 10f, 21.5f, 19f, 10f, 13f, 10f, 14f, 2.5f)
+            Glyph.STRENGTH -> {
+                rect(4f, 7f, 8f, 17f, 1.5f)
+                rect(16f, 7f, 20f, 17f, 1.5f)
+                path(2f, 10f, 2f, 14f)
+                path(22f, 10f, 22f, 14f)
+                path(8f, 12f, 16f, 12f)
+            }
+            Glyph.YOGA -> {
+                canvas.drawCircle(12f, 5f, 2f, paint)
+                path(5f, 14f, 8f, 12f, 10f, 9f, 14f, 9f, 16f, 12f, 19f, 14f)
+                path(12f, 15f, 7f, 17f, 4f, 19f, 8f, 20f, 16f, 20f, 20f, 19f, 17f, 17f, 12f, 15f)
+            }
             Glyph.BATTERY -> {
                 rect(2f, 7f, 19f, 17f)
                 path(22f, 10f, 22f, 14f)
@@ -276,7 +357,7 @@ internal data class ChartPoint(val axis: String, val label: String, val value: L
 
 internal class BarChart(
     context: Context, private val palette: Palette, private val points: List<ChartPoint>,
-    description: String?, private val durationAxis: Boolean
+    description: String?, private val accent: Int, private val durationAxis: Boolean
 ) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val peak = points.maxOfOrNull { it.value ?: 0 } ?: 0
@@ -336,7 +417,7 @@ internal class BarChart(
                 val y = bottom - (bottom - top) * (value / scale).toFloat()
                 val half = (step * .25f).coerceAtMost(context.dp(15).toFloat())
                 val radius = minOf(half, context.dp(5).toFloat())
-                paint.color = palette.chart
+                paint.color = accent
                 canvas.drawRoundRect(x - half, minOf(y, bottom - context.dp(2)), x + half, bottom, radius, radius, paint)
             }
         }
