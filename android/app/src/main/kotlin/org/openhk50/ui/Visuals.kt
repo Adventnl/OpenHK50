@@ -1,5 +1,6 @@
 package org.openhk50.ui
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -10,6 +11,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
 import android.view.View
+import android.view.animation.LinearInterpolator
 import androidx.core.graphics.ColorUtils
 import org.openhk50.data.Metric
 import org.openhk50.data.SleepSegment
@@ -22,20 +24,32 @@ internal data class Palette(
     val background: Int, val surface: Int, val ink: Int, val muted: Int, val border: Int,
     val tint: Int, val night: Boolean
 ) {
-    val brand get() = accent(0xffc1c9d7, 0xff465366)
-    val warning get() = heart
-    val calories get() = accent(0xffd5a6ab, 0xff854c58)
-    val workout get() = accent(0xffbeb1d1, 0xff655479)
-    val steps get() = accent(0xffa4bcd7, 0xff435f7c)
-    val sleep get() = accent(0xffaebad6, 0xff4f6186)
-    val heart get() = accent(0xffd3a1af, 0xff854b60)
-    val oxygen get() = accent(0xffa9bfc9, 0xff48626f)
-    val stress get() = accent(0xffcdb597, 0xff765b3c)
+    val brand get() = steps
+    val warning get() = legible(heart)
+    val calories get() = 0xffff3b42.toInt()
+    val workout get() = 0xffffdf00.toInt()
+    val steps get() = 0xff3988ff.toInt()
+    val sleep get() = 0xffa48aff.toInt()
+    val heart get() = calories
+    val oxygen get() = 0xff00c9ff.toInt()
+    val stress get() = 0xffffa225.toInt()
 
-    private fun accent(dark: Long, light: Long) = (if (night) dark else light).toInt()
+    val onAccent get() = Color.BLACK
 
-    val onAccent get() = if (night) 0xff17191d.toInt() else Color.WHITE
-    fun container(accent: Int) = ColorUtils.blendARGB(surface, accent, if (night) .12f else .055f)
+    fun legible(accent: Int): Int {
+        if (night || accent == ink || accent == muted) return accent
+        return when (accent) {
+            calories -> 0xffb91b2a.toInt()
+            workout -> 0xff695400.toInt()
+            steps -> 0xff0046b5.toInt()
+            sleep -> 0xff5d34aa.toInt()
+            oxygen -> 0xff005d78.toInt()
+            stress -> 0xff814200.toInt()
+            else -> accent
+        }
+    }
+
+    fun container(accent: Int) = ColorUtils.blendARGB(surface, accent, if (night) .18f else .10f)
     fun metric(metric: Metric?) = when (metric) {
         Metric.HEART -> heart
         Metric.OXYGEN -> oxygen
@@ -61,14 +75,12 @@ internal data class Palette(
 
     companion object {
         fun of(night: Boolean) = if (night) Palette(
-            color("#141518"), color("#202226"), color("#F3F3F5"), color("#B3B6BE"),
-            color("#3B3E45"), color("#30333A"), true
+            Color.BLACK, 0xff101216.toInt(), Color.WHITE, 0xffaeb7c7.toInt(),
+            0xff2b3039.toInt(), 0xff1a202b.toInt(), true
         ) else Palette(
-            color("#F3F4F6"), Color.WHITE, color("#22252B"), color("#555C68"),
-            color("#DADDE3"), color("#E8EBF0"), false
+            0xffedf3ff.toInt(), Color.WHITE, 0xff091325.toInt(), 0xff46536b.toInt(),
+            0xffd3deef.toInt(), 0xffe2ebfc.toInt(), false
         )
-
-        private fun color(hex: String) = Color.parseColor(hex)
     }
 }
 
@@ -121,10 +133,10 @@ internal val SleepStage.title get() = when (this) {
 }
 
 internal fun Palette.sleepColor(stage: SleepStage) = Color.parseColor(when (stage) {
-    SleepStage.LIGHT -> if (night) "#A5B9D0" else "#5A7798"
-    SleepStage.DEEP -> if (night) "#788CAE" else "#425677"
-    SleepStage.REM -> if (night) "#BDB0D0" else "#79668E"
-    SleepStage.AWAKE -> if (night) "#D1D3D9" else "#A8ABB3"
+    SleepStage.LIGHT -> if (night) "#44A6FF" else "#1B75D5"
+    SleepStage.DEEP -> if (night) "#6268FF" else "#3747C6"
+    SleepStage.REM -> if (night) "#C291FF" else "#8B4FD5"
+    SleepStage.AWAKE -> if (night) "#FFDF00" else "#A67A00"
 })
 
 internal fun Context.dp(value: Number) = (value.toFloat() * resources.displayMetrics.density).roundToInt()
@@ -135,26 +147,36 @@ internal fun Context.shape(color: Int, radius: Int, stroke: Int? = null) = Gradi
     if (stroke != null) setStroke(dp(1), stroke)
 }
 
-internal fun Context.navigationGlass(palette: Palette, radius: Int, selected: Boolean = false): GradientDrawable {
-    val colors = if (selected) {
-        if (palette.night) intArrayOf(0xff3b3f48.toInt(), 0xff30333a.toInt())
-        else intArrayOf(0xffedf0f4.toInt(), 0xffe1e6ed.toInt())
-    } else {
-        if (palette.night) intArrayOf(0xf32c2e34.toInt(), 0xee202226.toInt())
-        else intArrayOf(0xfaffffff.toInt(), 0xf0f3f4f6.toInt())
+internal fun Context.glassSurface(
+    palette: Palette, radius: Int, accent: Int? = null, floating: Boolean = false
+): GradientDrawable {
+    val top = when {
+        floating && palette.night -> 0xcf202a3a.toInt()
+        floating -> 0xe6f5f9ff.toInt()
+        accent != null -> ColorUtils.setAlphaComponent(palette.container(accent), 242)
+        palette.night -> 0xec151922.toInt()
+        else -> 0xfbffffff.toInt()
     }
-    val rim = if (palette.night) 0x45e1e4ea else 0xfaffffff.toInt()
-    return GradientDrawable(GradientDrawable.Orientation.TL_BR, colors).apply {
+    val bottom = when {
+        floating && palette.night -> 0xdf0a0c12.toInt()
+        floating -> 0xf0e4edfb.toInt()
+        accent != null -> ColorUtils.setAlphaComponent(palette.surface, 246)
+        palette.night -> 0xf1090a0d.toInt()
+        else -> 0xf5f7faff.toInt()
+    }
+    val rim = when {
+        accent != null -> ColorUtils.setAlphaComponent(accent, if (palette.night) 115 else 76)
+        palette.night -> 0x56c1d9ff
+        else -> 0xfaffffff.toInt()
+    }
+    return GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(top, bottom)).apply {
         cornerRadius = dp(radius).toFloat()
         setStroke(dp(1), rim)
     }
 }
 
 internal fun Context.accentSurface(palette: Palette, accent: Int, radius: Int = 24) =
-    GradientDrawable(GradientDrawable.Orientation.TR_BL, intArrayOf(
-        ColorUtils.blendARGB(palette.surface, accent, if (palette.night) .16f else .08f),
-        palette.container(accent)
-    )).apply { cornerRadius = dp(radius).toFloat() }
+    glassSurface(palette, radius, accent)
 
 internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = null) =
     pressable(shape(fill, radius, stroke), ink, radius)
@@ -169,12 +191,17 @@ internal enum class Glyph {
     RUN, CYCLE, HIKE, HIIT, STRENGTH, YOGA, SHARE
 }
 
-internal class Icon(context: Context, private val glyph: Glyph, private val color: Int) : View(context) {
+internal class Icon(context: Context, private val glyph: Glyph, private var color: Int) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.65f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
+    }
+    fun setColor(value: Int) {
+        if (color == value) return
+        color = value
+        invalidate()
     }
     private val lines = Path()
 
@@ -363,7 +390,7 @@ internal data class ChartPoint(val axis: String, val label: String, val value: L
 
 internal class BarChart(
     context: Context, private val palette: Palette, private val points: List<ChartPoint>,
-    description: String?, private val accent: Int, private val durationAxis: Boolean
+    description: String?, private val accent: Int, private val durationAxis: Boolean, private val reveal: Boolean
 ) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val peak = points.maxOfOrNull { it.value ?: 0 } ?: 0
@@ -379,6 +406,31 @@ internal class BarChart(
     init {
         contentDescription = description
         importantForAccessibility = if (description == null) IMPORTANT_FOR_ACCESSIBILITY_NO else IMPORTANT_FOR_ACCESSIBILITY_YES
+    }
+
+    private var animation: ValueAnimator? = null
+    private var progress = 1f
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (!reveal || !ValueAnimator.areAnimatorsEnabled()) return
+        progress = 0f
+        animation = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 650
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                progress = it.animatedFraction
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        animation?.cancel()
+        animation = null
+        progress = 1f
+        super.onDetachedFromWindow()
     }
 
     private fun numericHalfScale() = listOf(1, 2, 5, 10).first { it * magnitude >= halfPeak } * magnitude
@@ -420,7 +472,10 @@ internal class BarChart(
                 canvas.drawText(point.axis, x, height - font.descent, paint)
             }
             point.value?.let { value ->
-                val y = bottom - (bottom - top) * (value / scale).toFloat()
+                val delay = index.toFloat() / points.size * .25f
+                val t = arrive.getInterpolation(((progress - delay) / (1f - delay)).coerceIn(0f, 1f))
+                if (t == 0f) return@let
+                val y = bottom - (bottom - top) * (value / scale).toFloat() * t
                 val half = (step * .25f).coerceAtMost(context.dp(15).toFloat())
                 val radius = minOf(half, context.dp(5).toFloat())
                 paint.color = accent

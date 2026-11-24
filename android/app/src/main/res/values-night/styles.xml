@@ -1,7 +1,7 @@
 <resources>
     <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#141518</item>
-        <item name="android:colorAccent">#C1C9D7</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:colorAccent">#3988FF</item>
         <item name="android:windowActionModeOverlay">true</item>
     </style>
 </resources>

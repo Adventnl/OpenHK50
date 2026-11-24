@@ -5,8 +5,10 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.SweepGradient
+import android.graphics.Matrix
 import android.view.View
-import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.withRotation
 import androidx.core.graphics.withTranslation
@@ -23,20 +25,37 @@ internal class ActivityDial(
     private val start = previous ?: List(rings.size) { 0f }
     private var fraction = 1f
     private var animator: ValueAnimator? = null
+    private val gradients = rings.mapIndexed { index, ring ->
+        val angle = 136f + index * 25f
+        val end = (294f - index * 18f) / 360f
+        SweepGradient(72f, 72f, intArrayOf(
+            ColorUtils.blendARGB(ring.color, palette.background, if (palette.night) .30f else .12f),
+            ring.color,
+            ColorUtils.blendARGB(ring.color, android.graphics.Color.WHITE, .37f),
+            ring.color
+        ), floatArrayOf(0f, end * .56f, end, 1f)).apply {
+            setLocalMatrix(Matrix().apply { setRotate(angle, 72f, 72f) })
+        }
+    }
+    private val stagger = previous == null
 
     init { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
 
     val visibleProgress get() = targets.indices.map(::progress)
 
-    private fun progress(index: Int) = start[index] + (targets[index] - start[index]) * fraction
+    private fun progress(index: Int): Float {
+        val delay = if (stagger) index * .12f else 0f
+        val time = ((fraction - delay) / (1f - delay)).coerceIn(0f, 1f)
+        return start[index] + (targets[index] - start[index]) * arrive.getInterpolation(time)
+    }
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         if (start == targets || !ValueAnimator.areAnimatorsEnabled()) return
         fraction = 0f
         animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 620
-            interpolator = DecelerateInterpolator(2f)
+            duration = if (stagger) 900 else 590
+            interpolator = LinearInterpolator()
             addUpdateListener {
                 fraction = it.animatedValue as Float
                 invalidate()
@@ -73,8 +92,16 @@ internal class ActivityDial(
                 drawArc(72 - radius, 72 - radius, 72 + radius, 72 + radius, start, sweep, false, paint)
                 val progress = progress(index)
                 if (progress > 0) {
-                    paint.color = ring.color
+                    paint.shader = gradients[index]
+                    paint.alpha = 255
                     drawArc(72 - radius, 72 - radius, 72 + radius, 72 + radius, start, progress * sweep, false, paint)
+                    paint.shader = null
+                    withRotation(start + progress * sweep, 72f, 72f) {
+                        paint.style = Paint.Style.FILL
+                        paint.color = ColorUtils.blendARGB(ring.color, android.graphics.Color.WHITE, .52f)
+                        drawCircle(72f + radius, 72f, 2f, paint)
+                        paint.style = Paint.Style.STROKE
+                    }
                 }
             }
         }

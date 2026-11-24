@@ -79,7 +79,7 @@ internal class BandClient(
     private var exchange: Exchange? = null
     private var detailTransfer: DetailTransfer? = null
     private var deadline: Runnable? = null
-    private val liveSamples = ArrayList<Int>(6)
+    private var liveSamples: SpotSamples? = null
     private var stopRequested = false
     private var shutter: (() -> Unit)? = null
     private var cameraClosing = false
@@ -181,6 +181,7 @@ internal class BandClient(
 
     private fun closeLink(message: String?) {
         clearExchange()
+        liveSamples = null
         detailTransfer?.cancel()
         detailTransfer = null
         main.removeCallbacks(refresh)
@@ -446,15 +447,17 @@ internal class BandClient(
         availableDevice() ?: return
         val type = metric.liveType ?: return
         main.removeCallbacks(refresh)
-        liveSamples.clear()
+        liveSamples = SpotSamples(metric)
         stopRequested = false
         closingAfterMeasurement = false
         publish(state.copy(action = BandAction.MEASURING, measurement = metric, liveValue = null,
             measurementStopping = false, measurementMessage = null))
-        request(NativeProtocol.packet(LIVE, type, 1), if (metric == Metric.HEART) 60_000 else 30_000) { result ->
+        val timeout = if (metric == Metric.HEART) 60_000L else 30_000L
+        request(NativeProtocol.packet(LIVE, type, 1), timeout) { result ->
+            val hasReading = liveSamples?.median() != null
             val message = when {
-                result.rejected && liveSamples.isEmpty() -> "The band couldn’t measure. Check the fit and try again."
-                liveSamples.isEmpty() -> "No reading. Wear the band snugly and hold still."
+                result.rejected && !hasReading -> "The band couldn’t measure. Check the fit and try again."
+                !hasReading -> "No reading. Wear the band snugly and hold still."
                 else -> null
             }
             stopOnBand(metric, type, message)
@@ -477,10 +480,9 @@ internal class BandClient(
     private fun stopOnBand(metric: Metric, type: Int, message: String?) {
         if (!state.measurementStopping) publish(state.copy(measurementStopping = true))
         val device = state.device
-        val reading = if (device != null && liveSamples.isNotEmpty()) {
-            liveSamples.sort()
-            val median = (liveSamples[(liveSamples.size - 1) / 2] + liveSamples[liveSamples.size / 2]) / 2
-            liveSamples.clear()
+        val median = liveSamples?.median()
+        liveSamples = null
+        val reading = if (device != null && median != null) {
             Reading.live(device.address, metric, median, Instant.now()).also { save(listOf(it)) }
         } else null
         request(NativeProtocol.packet(LIVE_STOP, type, 0, 0), 500) { result ->
@@ -616,8 +618,7 @@ internal class BandClient(
     private fun request(packet: ByteArray, wait: Long, done: (Exchange) -> Unit) {
         val current = Exchange(packet[0].toInt() and 255, done)
         exchange = current
-        link.write(packet, withResponse = current.command == NativeProtocol.CAMERA ||
-            current.command == NativeProtocol.PHONE_ALERT) { ok ->
+        link.write(packet, withResponse = current.command in ACKNOWLEDGED_WRITES) { ok ->
             if (exchange != current) return@write
             if (!ok) {
                 lost("Couldn’t send to the band. Reconnect and try again.")
@@ -655,10 +656,12 @@ internal class BandClient(
                     if (error != 0) {
                         current.rejected = true
                         current.terminal = true
-                    } else if (value in metric.intervalValues) {
-                        liveSamples += value
-                        publish(state.copy(liveValue = value))
-                        current.terminal = metric != Metric.HEART && liveSamples.size >= 6
+                    } else {
+                        val samples = liveSamples ?: return
+                        if (samples.add(value)) {
+                            current.terminal = samples.complete
+                            if (state.liveValue != value) publish(state.copy(liveValue = value))
+                        }
                     }
                 }
                 else -> {
@@ -692,6 +695,7 @@ internal class BandClient(
     }
 
     companion object {
+        private val ACKNOWLEDGED_WRITES = setOf(LIVE, LIVE_STOP, NativeProtocol.CAMERA, NativeProtocol.PHONE_ALERT)
         fun permissions() = GattLink.permissions()
         fun hasPermissions(context: Context) = GattLink.hasPermissions(context)
     }
