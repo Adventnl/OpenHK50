@@ -5,8 +5,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.SweepGradient
-import android.graphics.Matrix
 import android.view.View
 import android.view.animation.LinearInterpolator
 import androidx.core.graphics.ColorUtils
@@ -25,18 +23,6 @@ internal class ActivityDial(
     private val start = previous ?: List(rings.size) { 0f }
     private var fraction = 1f
     private var animator: ValueAnimator? = null
-    private val gradients = rings.mapIndexed { index, ring ->
-        val angle = 136f + index * 25f
-        val end = (294f - index * 18f) / 360f
-        SweepGradient(72f, 72f, intArrayOf(
-            ColorUtils.blendARGB(ring.color, palette.background, if (palette.night) .30f else .12f),
-            ring.color,
-            ColorUtils.blendARGB(ring.color, android.graphics.Color.WHITE, .37f),
-            ring.color
-        ), floatArrayOf(0f, end * .56f, end, 1f)).apply {
-            setLocalMatrix(Matrix().apply { setRotate(angle, 72f, 72f) })
-        }
-    }
     private val stagger = previous == null
 
     init { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
@@ -92,16 +78,8 @@ internal class ActivityDial(
                 drawArc(72 - radius, 72 - radius, 72 + radius, 72 + radius, start, sweep, false, paint)
                 val progress = progress(index)
                 if (progress > 0) {
-                    paint.shader = gradients[index]
-                    paint.alpha = 255
+                    paint.color = ring.color
                     drawArc(72 - radius, 72 - radius, 72 + radius, 72 + radius, start, progress * sweep, false, paint)
-                    paint.shader = null
-                    withRotation(start + progress * sweep, 72f, 72f) {
-                        paint.style = Paint.Style.FILL
-                        paint.color = ColorUtils.blendARGB(ring.color, android.graphics.Color.WHITE, .52f)
-                        drawCircle(72f + radius, 72f, 2f, paint)
-                        paint.style = Paint.Style.STROKE
-                    }
                 }
             }
         }

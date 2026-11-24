@@ -17,8 +17,8 @@ internal data class Workout(
         if (type == WorkoutType.STRENGTH) profile?.strengthActiveKcal(seconds(now)) else null
 }
 
-internal class WorkoutEnergyProfile(weightKg: Double, bodyFatPercent: Double) {
-    val basalKcalPerDay = 500 + 22 * weightKg * (1 - bodyFatPercent / 100) // Cunningham (1980)
+internal class WorkoutEnergyProfile(weightKg: Double, bodyFatPercent: Double, basal: Double? = null) {
+    val basalKcalPerDay = basal ?: 500 + 22 * weightKg * (1 - bodyFatPercent / 100) // Cunningham (1980)
     private val activeStrengthKcalPerMinute: Double
 
     init {

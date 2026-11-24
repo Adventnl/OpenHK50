@@ -9,6 +9,10 @@ providers.fileContents(rootProject.layout.projectDirectory.file('local.propertie
 }
 def workoutWeightKg = localProperties.getProperty('openhk50.workout.weightKg')?.toDouble()
 def workoutBodyFatPercent = localProperties.getProperty('openhk50.workout.bodyFatPercent')?.toDouble()
+def measuredBasalKcal = localProperties.getProperty('openhk50.workout.basalKcalPerDay')?.toDouble()
+if (measuredBasalKcal != null && !(measuredBasalKcal > 0 && measuredBasalKcal <= 10_000)) {
+    throw new GradleException('Set a valid daily BMR in android/local.properties.')
+}
 if ((workoutWeightKg != null || workoutBodyFatPercent != null) &&
         !(workoutWeightKg > 0 && workoutWeightKg <= 400 && workoutBodyFatPercent > 0 && workoutBodyFatPercent < 100)) {
     throw new GradleException('Set a valid weight in kg and body fat percentage together in android/local.properties.')
@@ -35,6 +39,7 @@ android {
         ndk.abiFilters 'arm64-v8a', 'x86_64'
         buildConfigField 'Double', 'WORKOUT_WEIGHT_KG', workoutWeightKg?.toString() ?: 'null'
         buildConfigField 'Double', 'WORKOUT_BODY_FAT_PERCENT', workoutBodyFatPercent?.toString() ?: 'null'
+        buildConfigField 'Double', 'MEASURED_BASAL_KCAL', measuredBasalKcal?.toString() ?: 'null'
     }
 
     compileOptions {

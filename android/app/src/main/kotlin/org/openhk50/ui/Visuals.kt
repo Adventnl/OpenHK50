@@ -147,36 +147,11 @@ internal fun Context.shape(color: Int, radius: Int, stroke: Int? = null) = Gradi
     if (stroke != null) setStroke(dp(1), stroke)
 }
 
-internal fun Context.glassSurface(
-    palette: Palette, radius: Int, accent: Int? = null, floating: Boolean = false
-): GradientDrawable {
-    val top = when {
-        floating && palette.night -> 0xcf202a3a.toInt()
-        floating -> 0xe6f5f9ff.toInt()
-        accent != null -> ColorUtils.setAlphaComponent(palette.container(accent), 242)
-        palette.night -> 0xec151922.toInt()
-        else -> 0xfbffffff.toInt()
-    }
-    val bottom = when {
-        floating && palette.night -> 0xdf0a0c12.toInt()
-        floating -> 0xf0e4edfb.toInt()
-        accent != null -> ColorUtils.setAlphaComponent(palette.surface, 246)
-        palette.night -> 0xf1090a0d.toInt()
-        else -> 0xf5f7faff.toInt()
-    }
-    val rim = when {
-        accent != null -> ColorUtils.setAlphaComponent(accent, if (palette.night) 115 else 76)
-        palette.night -> 0x56c1d9ff
-        else -> 0xfaffffff.toInt()
-    }
-    return GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(top, bottom)).apply {
-        cornerRadius = dp(radius).toFloat()
-        setStroke(dp(1), rim)
-    }
-}
+internal fun Context.panelSurface(palette: Palette, radius: Int, accent: Int? = null) =
+    shape(accent?.let(palette::container) ?: palette.surface, radius, palette.border)
 
 internal fun Context.accentSurface(palette: Palette, accent: Int, radius: Int = 24) =
-    glassSurface(palette, radius, accent)
+    panelSurface(palette, radius, accent)
 
 internal fun Context.pressable(fill: Int, ink: Int, radius: Int, stroke: Int? = null) =
     pressable(shape(fill, radius, stroke), ink, radius)

@@ -48,8 +48,13 @@ import org.openhk50.band.BandAction
 import org.openhk50.band.BandClient
 import org.openhk50.band.BandState
 import org.openhk50.band.CallRelayService
+import org.openhk50.band.SpotCheckService
 import org.openhk50.band.Connection
 import org.openhk50.data.HealthStore
+import org.openhk50.data.EcgTrace
+import org.openhk50.data.HealthInsights
+import org.openhk50.data.HeartSample
+import org.openhk50.data.stepFactor
 import org.openhk50.data.Metric
 import org.openhk50.data.DAY_BUCKET_HOURS
 import org.openhk50.data.DailyEnergy
@@ -84,7 +89,7 @@ class MainActivity : ComponentActivity() {
         WORKOUT_TYPES("Choose workout", Glyph.WALK, false), BACKUP("Backup", Glyph.BACKUP, false),
         CAMERA("Camera remote", Glyph.CAMERA, false), CLOCK("Phone clock", Glyph.CLOCK, false),
         MEASURE("Measure", Glyph.PULSE, false), VIBRATION("Phone vibration", Glyph.PHONE, false),
-        PRIVACY("Privacy", Glyph.CHECK, false)
+        PRIVACY("Privacy", Glyph.CHECK, false), ECG("ECG", Glyph.PULSE, false)
     }
     private enum class PermissionAction { SCAN, RECONNECT, CALL_ALERTS }
     private enum class Goal(val title: String, val unit: String, val target: Int, val max: Int, val metric: Metric?) {
@@ -119,6 +124,9 @@ class MainActivity : ComponentActivity() {
     private var historyDate = LocalDate.now()
     private var historyPeriod = HistoryPeriod.DAY
     private var currentDay: HealthStore.Day? = null
+    private var latestHeart: HeartSample? = null
+    private var insights: HealthInsights? = null
+    private var renderTodayHeart: (() -> Unit)? = null
     private var activityDate: LocalDate? = null
     private var activityMinutes: List<Long>? = null
     private var updateEnergy: (() -> Unit)? = null
@@ -132,10 +140,10 @@ class MainActivity : ComponentActivity() {
     private var workoutCalories: TextView? = null
     private var popup: Dialog? = null
     private var measureMetric = Metric.HEART
-    private var pendingMeasurement = false
+    private var measureParent = Tab.HEALTH
     private var renderMeasurement: ((BandState) -> Unit)? = null
     private val workoutEnergyProfile = BuildConfig.WORKOUT_WEIGHT_KG?.let { weight ->
-        BuildConfig.WORKOUT_BODY_FAT_PERCENT?.let { bodyFat -> WorkoutEnergyProfile(weight, bodyFat) }
+        BuildConfig.WORKOUT_BODY_FAT_PERCENT?.let { bodyFat -> WorkoutEnergyProfile(weight, bodyFat, BuildConfig.MEASURED_BASAL_KCAL) }
     }
     private var camera: BandCamera? = null
     private var cameraPermissionPending = false
@@ -177,6 +185,19 @@ class MainActivity : ComponentActivity() {
     private var lastDevice: String? = null
     private var lastShownDate: LocalDate? = null
     private val displayPrefs by lazy { getSharedPreferences("display", MODE_PRIVATE) }
+
+    private var ecgTrace: EcgTrace? = null
+    private var ecgLoading = false
+    private var ecgLoaded = false
+    private var ecgGeneration = 0
+    private var ecgIssue: String? = null
+    private val ecgPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) updateEcg("Couldn’t import this file. Choose an Apple Watch ECG CSV or a time_ms,mv CSV.") {
+            val trace = checkNotNull(contentResolver.openInputStream(uri)).bufferedReader().use(EcgTrace::readCsv)
+            app.ecg.save(trace)
+            trace
+        }
+    }
 
     private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val action = permissionAction
@@ -230,6 +251,7 @@ class MainActivity : ComponentActivity() {
         historyPeriod = savedInstanceState?.getString("period")?.let(HistoryPeriod::valueOf) ?: HistoryPeriod.DAY
         workoutPage = savedInstanceState?.getInt("workoutPage") ?: 0
         measureMetric = savedInstanceState?.getString("measureMetric")?.let(Metric::valueOf) ?: Metric.HEART
+        measureParent = savedInstanceState?.getString("measureParent")?.let(Tab::valueOf) ?: Tab.HEALTH
         historyMetric = when (val metric = savedInstanceState?.getString("metric")) {
             null -> Metric.HEART
             "SLEEP" -> null
@@ -261,9 +283,13 @@ class MainActivity : ComponentActivity() {
             }
         }
         band.changed = {
+            renderTodayHeart?.invoke()
             val device = band.state.device?.address
             if (lastDevice != device) {
                 lastDevice = device
+                latestHeart = null
+                insights = null
+                renderTodayHeart?.invoke()
                 currentDay = null
                 activityMinutes = null
                 dailyDial = null
@@ -279,11 +305,12 @@ class MainActivity : ComponentActivity() {
             }
             if (tab == Tab.CAMERA) {
                 camera?.update()
-            } else if (tab == Tab.MEASURE) updateMeasurement()
+            } else if (tab == Tab.MEASURE) renderMeasurement?.invoke(band.state)
             else if (tab == Tab.BAND && shownBandState != band.state) refreshScreen()
         }
         band.foreground(true)
-        if (tab == Tab.MEASURE) updateMeasurement()
+        if (tab == Tab.MEASURE) renderMeasurement?.invoke(band.state)
+        if (tab == Tab.ECG) loadEcg()
         if (app.settings.state().endpoint != null) BackupJob.schedule(this)
         loadData()
         app.main.postDelayed(checkDay, 30_000)
@@ -312,7 +339,6 @@ class MainActivity : ComponentActivity() {
         band.changed = null
         app.main.removeCallbacks(tickWorkout)
         app.main.removeCallbacks(checkDay)
-        if (tab == Tab.MEASURE && !isChangingConfigurations) stopHealthMeasurement()
         if (!isChangingConfigurations && permissionAction == null && !cameraPermissionPending) band.foreground(false)
     }
 
@@ -335,6 +361,7 @@ class MainActivity : ComponentActivity() {
         outState.putString("period", historyPeriod.name)
         outState.putInt("workoutPage", workoutPage)
         outState.putString("measureMetric", measureMetric.name)
+        outState.putString("measureParent", measureParent.name)
         outState.putString("metric", historyMetric?.name ?: "SLEEP")
         outState.putString("permission", permissionAction?.name)
         super.onSaveInstanceState(outState)
@@ -493,7 +520,6 @@ class MainActivity : ComponentActivity() {
         revealedCharts.clear()
         deferredRefresh = null
         if (!next.inNavigation && !returning) tabPositions.remove(next)
-        if (tab == Tab.MEASURE) stopHealthMeasurement()
         val previousCamera = camera
         camera = null
         if (next == Tab.HISTORY || next == Tab.WORKOUT_TYPES) detailParent = tab
@@ -537,7 +563,8 @@ class MainActivity : ComponentActivity() {
 
     private fun backDestination() = when (tab) {
         Tab.BACKUP, Tab.CAMERA, Tab.CLOCK, Tab.VIBRATION, Tab.PRIVACY -> Tab.BAND
-        Tab.MEASURE -> Tab.HEALTH
+        Tab.MEASURE -> measureParent
+        Tab.ECG -> Tab.HEALTH
         Tab.DAILY_ACTIVITY -> Tab.TODAY
         Tab.HISTORY, Tab.WORKOUT_TYPES -> detailParent
         else -> Tab.TODAY
@@ -607,6 +634,8 @@ class MainActivity : ComponentActivity() {
                     },
                     pending = if (destination == Tab.BACKUP) app.health.pendingCount() else 0L,
                     summary = if (destination == Tab.TODAY) loadSummary(address, date, zone) else null,
+                    latestHeart = if (destination == Tab.TODAY) app.health.latestHeart(address) else null,
+                    insights = if (destination == Tab.HEALTH) app.health.insights(address, date, zone) else null,
                     activityMinutes = if (destination == Tab.DAILY_ACTIVITY) {
                         app.health.workoutMinuteBuckets(dayBoundaries(date, zone))
                     } else null
@@ -625,7 +654,8 @@ class MainActivity : ComponentActivity() {
                 if (snapshot != null) {
                     val visibleChanged = currentDay != snapshot.day || trend != snapshot.trend ||
                         (snapshot.workouts != null && workouts != snapshot.workouts) ||
-                        summary != snapshot.summary || activityMinutes != snapshot.activityMinutes
+                        summary != snapshot.summary || activityMinutes != snapshot.activityMinutes ||
+                        latestHeart != snapshot.latestHeart || insights != snapshot.insights
                     val redraw = destination == Tab.BACKUP || changedPage || readIssue != null || visibleChanged ||
                         shownWorkoutBusy != workoutBusy || shownStorageIssue != app.storageIssue ||
                         cached != (query to snapshot)
@@ -649,11 +679,14 @@ class MainActivity : ComponentActivity() {
         if (tab == Tab.TODAY || tab == Tab.ACTIVITY) workouts = data?.workouts
         pendingCount = data?.pending ?: 0
         summary = data?.summary
+        latestHeart = data?.latestHeart
+        insights = data?.insights
     }
 
     private data class DataSnapshot(
         val day: HealthStore.Day?, val trend: HealthStore.Trend?,
-        val workouts: WorkoutLog?, val pending: Long, val summary: SummaryData?, val activityMinutes: List<Long>?
+        val workouts: WorkoutLog?, val pending: Long, val summary: SummaryData?,
+        val latestHeart: HeartSample?, val insights: HealthInsights?, val activityMinutes: List<Long>?
     )
 
     private data class SummaryData(
@@ -680,6 +713,7 @@ class MainActivity : ComponentActivity() {
         workoutTimer = null
         workoutCalories = null
         updateEnergy = null
+        renderTodayHeart = null
         renderMeasurement = null
         renderBandAlerts = null
         shownWorkoutBusy = workoutBusy
@@ -727,6 +761,7 @@ class MainActivity : ComponentActivity() {
             Tab.BACKUP -> backupPage(page)
             Tab.WORKOUT_TYPES -> workoutTypes(page)
             Tab.MEASURE -> measurementPage(page)
+            Tab.ECG -> ecgPage(page)
             Tab.VIBRATION -> vibrationPage(page)
             Tab.PRIVACY -> privacyPage(page)
             Tab.CAMERA, Tab.CLOCK -> Unit
@@ -832,6 +867,8 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
         }, 10)
 
+        block(page, todayHeartPanel(), 10)
+
         heading(page, "Workouts", 17)
         val log = workouts
         val activeWorkout = log?.active
@@ -856,6 +893,35 @@ class MainActivity : ComponentActivity() {
             openHistory(null, today.minusDays(1), HistoryPeriod.WEEK)
         }, lp(-1, -2))
         block(page, trends, 0)
+    }
+
+    private fun todayHeartPanel() = panel().apply {
+        val value = label("—", 15, palette.muted, "sans-serif-medium")
+        val heart = summaryRow("Heart rate", Glyph.PULSE, null, accent = palette.heart, valueView = value) {
+            openMeasurement(Metric.HEART)
+        }
+        addView(heart)
+        val date = label("", 13, palette.muted).apply { visibility = View.GONE }
+        block(this, date, 0)
+        renderTodayHeart = {
+            val state = band.state
+            val measuring = state.measurement == Metric.HEART && state.action == BandAction.MEASURING
+            val bandSample = latestHeart
+            val bpm = state.liveValue?.takeIf { measuring } ?: bandSample?.bpm
+            val result = bpm?.let { displayValue(Metric.HEART, it.toLong()) } ?: "—"
+            if (value.text != result) value.text = result
+            value.setTextColor(if (bpm == null) palette.muted else palette.legible(palette.heart))
+            val status = when {
+                measuring -> "Measuring…"
+                state.queuedMeasurement == Metric.HEART -> "Waiting for band…"
+                bandSample != null -> dateTime(bandSample.time, band.zone)
+                else -> null
+            }
+            date.visibility = if (status == null) View.GONE else View.VISIBLE
+            if (date.text != status.orEmpty()) date.text = status.orEmpty()
+            heart.contentDescription = listOfNotNull("Heart rate", bpm?.let { result }, status).joinToString(", ")
+        }
+        renderTodayHeart?.invoke()
     }
 
     private fun selectedActivityDate(today: LocalDate) = activityDate?.coerceAtMost(today) ?: today
@@ -1041,7 +1107,40 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun basalKcalPerDay() = displayPrefs.getInt(BMR_KCAL, 0).takeIf { it > 0 }?.toDouble()
-        ?: workoutEnergyProfile?.basalKcalPerDay
+        ?: BuildConfig.MEASURED_BASAL_KCAL ?: workoutEnergyProfile?.basalKcalPerDay
+
+    private fun calibrateSteps(address: String) {
+        showPopup("Calibrate steps") { dialog ->
+            note(this, "Count at least 50 steps. Sync before and after, then enter the increase in the band’s count.", 0)
+            val current = app.health.stepFactor(address)
+            if (current != 1.0) note(this, "Reset calibration before measuring another walk.", 8)
+            fun field(name: String): EditText {
+                val input = popupInput(name, InputType.TYPE_CLASS_NUMBER)
+                block(this, label(name, 14, palette.muted).apply { labelFor = input.id }, 12)
+                block(this, input, 5)
+                return input
+            }
+            val counted = field("Steps you counted")
+            val bandCount = field("Steps the band added")
+            if (current != 1.0) addButton(this, "Reset calibration", filled = false, top = 10) {
+                app.health.setStepFactor(address, null)
+                cachedData.clear()
+                dialog.dismiss()
+                drawScreen(keepScroll = true)
+            }
+            popupActions(this, dialog, "Save") {
+                val factor = stepFactor(counted.text.toString().toIntOrNull(), bandCount.text.toString().toIntOrNull())
+                if (factor == null) {
+                    bandCount.error = "Enter both counts from the same walk of at least 50 steps."
+                } else {
+                    app.health.setStepFactor(address, factor)
+                    cachedData.clear()
+                    dialog.dismiss()
+                    drawScreen(keepScroll = true)
+                }
+            }
+        }
+    }
 
     private fun editBasalEnergy() {
         showPopup("Resting calories", secure = true) { dialog ->
@@ -1062,7 +1161,7 @@ class MainActivity : ComponentActivity() {
                 } else saveBasalEnergy(dialog, kcal)
             }
             if (displayPrefs.contains(BMR_KCAL)) {
-                addButton(this, if (workoutEnergyProfile == null) "Clear BMR" else "Use build profile",
+                addButton(this, if (workoutEnergyProfile == null && BuildConfig.MEASURED_BASAL_KCAL == null) "Clear BMR" else "Use build profile",
                     filled = false, top = 8) { saveBasalEnergy(dialog, null) }
             }
         }
@@ -1077,6 +1176,8 @@ class MainActivity : ComponentActivity() {
             }
             val weight = field("Weight (kg)", 0)
             val bodyFat = field("Body fat (%)", 10)
+            BuildConfig.WORKOUT_WEIGHT_KG?.let { weight.setText(NumberFormat.getNumberInstance().format(it)) }
+            BuildConfig.WORKOUT_BODY_FAT_PERCENT?.let { bodyFat.setText(NumberFormat.getNumberInstance().format(it)) }
             fun decimalValue(input: EditText): Double? {
                 val text = input.text.toString().trim()
                 val position = java.text.ParsePosition(0)
@@ -1157,6 +1258,7 @@ class MainActivity : ComponentActivity() {
             openMeasurement(Metric.HEART)
         }, 0)
         block(page, button("Other measurements", filled = false, action = ::chooseMeasurement), 8)
+        insightPanel(page, today)
         heading(page, "Daily averages", 24)
         showReadIssues(page)
         val day = currentDay
@@ -1167,6 +1269,115 @@ class MainActivity : ComponentActivity() {
         }
         block(page, metrics, 10)
         block(page, sleepPanel(day?.sleep, today), 14)
+        val waveform = panel()
+        waveform.addView(summaryRow("ECG", Glyph.PULSE, null, showMissing = false) {
+            go(Tab.ECG)
+            loadEcg()
+        })
+        block(page, waveform, 10)
+    }
+
+    private fun insightPanel(page: LinearLayout, today: LocalDate) {
+        val data = insights
+        heading(page, "Recovery and strain", 24)
+        val scores = panel()
+        fun score(value: Int?) = value?.let { "$it / 100" }
+        scores.addView(summaryRow("Recovery", Glyph.MOON, score(data?.recovery), accent = palette.sleep) {
+            showPopup("Recovery") { _ ->
+                val night = data?.night
+                val baseline = data?.baselineNights ?: 0
+                detailLine(this, "Baseline nights").text = if (baseline < 7) "$baseline / 7" else number(baseline.toLong())
+                detailLine(this, "Sleep").text = night?.let { duration(it.sleepMinutes) } ?: "—"
+                detailLine(this, "Sleeping heart rate").text = night?.heartBpm?.let { "$it bpm" } ?: "—"
+                detailLine(this, "Sleeping HRV").text = night?.hrv?.let { "$it ms" } ?: "—"
+                if (data?.recovery == null) note(this, "Sync after wearing the band overnight.", 10)
+            }
+        })
+        divider(scores)
+        scores.addView(summaryRow("Strain", Glyph.FLAME, score(data?.strain), accent = palette.stress) {
+            showPopup("Strain") { dialog ->
+                detailLine(this, "Heart-rate coverage").text = duration(data?.heartMinutes ?: 0)
+                if (data?.strain == null) note(this, "Needs a resting baseline and 30 minutes of heart-rate coverage.", 10)
+                addButton(this, "Heart-rate history", filled = false, top = 10) {
+                    dialog.dismiss()
+                    openHistory(Metric.HEART, today)
+                }
+            }
+        })
+        block(page, scores, 9)
+    }
+
+    private fun loadEcg() {
+        if (!ecgLoaded && !ecgLoading) {
+            updateEcg("Couldn’t open the saved ECG. Import the recording again.", app.ecg::read)
+        }
+    }
+
+    private fun updateEcg(failure: String, work: () -> EcgTrace?) {
+        val generation = ++ecgGeneration
+        ecgLoading = true
+        ecgIssue = null
+        if (active && tab == Tab.ECG) refreshScreen()
+        app.databaseThread.execute {
+            val result = runCatching(work)
+            app.main.post {
+                if (generation != ecgGeneration) return@post
+                ecgLoading = false
+                ecgLoaded = true
+                result.onSuccess { ecgTrace = it }.onFailure { ecgIssue = failure }
+                if (active && tab == Tab.ECG) refreshScreen()
+            }
+        }
+    }
+
+    private fun ecgPage(page: LinearLayout) {
+        val trace = ecgTrace
+        val card = panel()
+        if (trace != null) {
+            val chart = EcgChart(this, palette, trace)
+            val format = NumberFormat.getNumberInstance().apply { maximumFractionDigits = 1 }
+            val range = format.format(chart.voltageRange)
+            note(card, "Voltage · ±$range mV", 4)
+            block(card, chart, 8, dp(210))
+            val time = label("", 14, palette.ink)
+            fun position(milliseconds: Int) {
+                chart.startMs = milliseconds.toFloat()
+                val left = format.format(milliseconds / 1000.0)
+                val right = format.format((milliseconds + chart.windowMs) / 1000.0)
+                time.text = "$left–$right sec"
+            }
+            position(0)
+            block(card, time, 6)
+            if (trace.durationMs > chart.windowMs) {
+                val scrubber = android.widget.SeekBar(this).apply {
+                    max = ((trace.durationMs - chart.windowMs) / 100).toInt()
+                    contentDescription = "Recording position"
+                    setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(bar: android.widget.SeekBar, progress: Int, fromUser: Boolean) =
+                            position(progress * 100)
+                        override fun onStartTrackingTouch(bar: android.widget.SeekBar) = Unit
+                        override fun onStopTrackingTouch(bar: android.widget.SeekBar) = Unit
+                    })
+                }
+                block(card, scrubber, 6, dp(48))
+            }
+        } else note(card, if (ecgLoading) "Loading ECG…" else "Import an ECG recording to view its waveform.", 4)
+        ecgIssue?.let { note(card, it, 8, warning = true) }
+        addButton(card, if (trace == null) "Import CSV" else "Replace recording", enabled = !ecgLoading, top = 12) {
+            ecgPicker.launch(arrayOf("text/*", "application/octet-stream"))
+        }
+        if (trace != null) addButton(card, "Delete recording", filled = false, enabled = !ecgLoading, top = 6) {
+            showPopup("Delete this ECG?") { dialog ->
+                popupActions(this, dialog, "Delete") {
+                    dialog.dismiss()
+                    updateEcg("Couldn’t delete the recording.") {
+                        app.ecg.clear()
+                        null
+                    }
+                }
+            }
+        }
+        block(page, card, 10)
     }
 
     private fun chooseMeasurement() {
@@ -1177,27 +1388,22 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openMeasurement(metric: Metric) {
+        measureParent = if (tab == Tab.TODAY) Tab.TODAY else Tab.HEALTH
         measureMetric = metric
-        pendingMeasurement = band.state.connection == Connection.CONNECTED
         go(Tab.MEASURE)
-        updateMeasurement()
+        startMeasurement(metric)
     }
 
-    private fun updateMeasurement() {
-        if (pendingMeasurement) {
-            val state = band.state
-            if (state.connection != Connection.CONNECTED) pendingMeasurement = false
-            else if (state.action == BandAction.IDLE) {
-                pendingMeasurement = false
-                band.measure(measureMetric)
-            }
+    private fun startMeasurement(metric: Metric) {
+        if (band.state.connection != Connection.CONNECTED || band.spotCheckPending) return
+        band.queueMeasurement(metric)
+        try {
+            startForegroundService(Intent(this, SpotCheckService::class.java))
+        } catch (_: IllegalStateException) {
+            band.measurementStartFailed()
+        } catch (_: SecurityException) {
+            band.measurementStartFailed()
         }
-        renderMeasurement?.invoke(band.state)
-    }
-
-    private fun stopHealthMeasurement() {
-        pendingMeasurement = false
-        band.stopMeasurement()
     }
 
     private fun measurementPage(page: LinearLayout) {
@@ -1206,13 +1412,13 @@ class MainActivity : ComponentActivity() {
         val live = panel(radius = 26).apply { background = accentSurface(palette, accent, 26) }
         section(live, metric.icon, metric.title, accent)
         val value = readout("—", size = 58, accent = accent)
-        val trace = PulseTrace(this, accent)
+        val trace = MeasurementProgress(this, accent)
         val status = label("", 14, palette.muted).apply {
             minLines = 2
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
         block(live, value, 14)
-        block(live, trace, 8, dp(42))
+        block(live, trace, 12, dp(6))
         block(live, status, 10)
         var action: () -> Unit = {}
         val control = button("Start", filled = true, accent = accent) { action() }
@@ -1223,6 +1429,7 @@ class MainActivity : ComponentActivity() {
             val connected = state.connection == Connection.CONNECTED
             val selected = state.measurement == metric
             val measuring = selected && state.action == BandAction.MEASURING
+            val pendingMeasurement = state.queuedMeasurement == metric
             val reading = state.liveValue?.takeIf { selected && !pendingMeasurement }
             if (reading != lastReading) {
                 value.text = reading?.let { readoutText(number(it.toLong()), metric.unit) } ?: "—"
@@ -1234,6 +1441,7 @@ class MainActivity : ComponentActivity() {
                 pendingMeasurement -> "Waiting for the band…"
                 measuring && state.measurementStopping -> "Finishing…"
                 measuring -> "Keep your wrist still."
+                band.spotCheckPending -> "Another spot check is running."
                 selected && state.measurementMessage != null -> state.measurementMessage
                 reading != null && app.storageIssue != null -> app.storageIssue
                 reading != null -> "Spot check"
@@ -1248,21 +1456,15 @@ class MainActivity : ComponentActivity() {
             }
             if (control.text != title) control.text = title
             control.isEnabled = !connected || pendingMeasurement || (measuring && !state.measurementStopping) ||
-                state.action == BandAction.IDLE
+                !band.spotCheckPending
             action = {
                 when {
                     !connected -> {
                         tabPositions.remove(Tab.BAND)
                         go(Tab.BAND)
                     }
-                    measuring || pendingMeasurement -> {
-                        stopHealthMeasurement()
-                        updateMeasurement()
-                    }
-                    else -> {
-                        pendingMeasurement = true
-                        updateMeasurement()
-                    }
+                    measuring || pendingMeasurement -> band.stopMeasurement()
+                    else -> startMeasurement(metric)
                 }
             }
         }
@@ -1431,7 +1633,7 @@ class MainActivity : ComponentActivity() {
 
     private fun summaryRow(
         title: String, icon: Glyph, value: String?, showMissing: Boolean = true,
-        accent: Int = palette.glyph(icon), action: () -> Unit
+        accent: Int = palette.glyph(icon), valueView: TextView? = null, action: () -> Unit
     ) = row().apply {
         minimumHeight = dp(55)
         setPadding(0, dp(7), 0, dp(7))
@@ -1444,7 +1646,8 @@ class MainActivity : ComponentActivity() {
         addView(label(title, 16, palette.ink, "sans-serif-medium")
             .apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }, lp(0, -2, 1f).apply { marginStart = dp(12) })
         if (value != null || showMissing) {
-            val reading = label(value ?: "—", 15, if (value == null) palette.muted else palette.legible(accent), "sans-serif-medium").apply {
+            val reading = (valueView ?: label(value ?: "—", 15,
+                if (value == null) palette.muted else palette.legible(accent), "sans-serif-medium")).apply {
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
             addView(reading, lp(-2, -2).apply { marginStart = dp(8) })
@@ -1823,19 +2026,24 @@ class MainActivity : ComponentActivity() {
         heading(page, "Settings", 25)
         val actions = panel()
         preferenceSwitch(actions, "Auto-sync", band.autoSync, change = band::setAutoSync)
+        state.device?.let { device ->
+            val factor = app.health.stepFactor(device.address)
+            val calibration = if (factor == 1.0) null else NumberFormat.getPercentInstance().format(factor)
+            actionRow(actions, "Calibrate steps", Glyph.STEPS, true, calibration) { calibrateSteps(device.address) }
+        }
         if (connected) {
             actionRow(actions, "Sync past 7 days", Glyph.CALENDAR, idle) { band.importHistory(true) }
             actionRow(actions, "Set band clock", Glyph.CLOCK, idle) { band.setClock() }
             val logging = state.automaticHeartLogging
             val loggingMode = when (logging) {
-                true -> "Every 5 minutes"
+                true -> "Every 15 minutes"
                 false -> "On demand"
                 null -> if (idle) "Couldn’t confirm. Tap to retry." else null
             }
             actionRow(actions, "Heart-rate logging", Glyph.PULSE, idle, loggingMode) {
                 showChoices("Heart-rate logging", listOf(
                     Choice("On demand", Glyph.PULSE, logging == false),
-                    Choice("Every 5 minutes", Glyph.CLOCK, logging == true)
+                    Choice("Every 15 minutes", Glyph.CLOCK, logging == true)
                 )) { band.setLogging(it == 1) }
             }
             if (state.detailSyncAvailable) {
@@ -2316,7 +2524,7 @@ class MainActivity : ComponentActivity() {
             block(this, fields, 18)
         }
         dialog.setContentView(ScrollView(this).apply {
-            background = glassSurface(palette, 26, palette.brand)
+            background = panelSurface(palette, 26, palette.brand)
             clipToOutline = true
             isVerticalScrollBarEnabled = false
             addView(body, FrameLayout.LayoutParams(-1, -2))
@@ -2451,7 +2659,7 @@ class MainActivity : ComponentActivity() {
             val ink = if (enabled) palette.onAccent else palette.muted
             minimumHeight = dp(64)
             setPadding(dp(16), dp(10), dp(16), dp(10))
-            background = pressable(accentAction(fill, 18), ink, 18)
+            background = pressable(shape(fill, 18), ink, 18)
             this.isEnabled = enabled
             isFocusable = enabled
             contentDescription = title
@@ -2460,13 +2668,6 @@ class MainActivity : ComponentActivity() {
             addView(label(title, 21, ink, "sans-serif-medium").ignoreAccessibility(),
                 lp(0, -2, 1f))
             addView(Icon(this@MainActivity, glyph, ink), lp(dp(24), dp(24)).apply { marginStart = dp(9) })
-        }
-
-    private fun accentAction(color: Int, radius: Int) =
-        android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
-            intArrayOf(ColorUtils.blendARGB(color, Color.WHITE, .27f), color, color)).apply {
-            cornerRadius = dp(radius).toFloat()
-            setStroke(dp(1), ColorUtils.blendARGB(color, Color.WHITE, .48f))
         }
 
     private fun stackTiles() = resources.configuration.let {
@@ -2496,7 +2697,7 @@ class MainActivity : ComponentActivity() {
         block(parent, label(text, 14, if (warning) palette.warning else palette.muted).apply { setLineSpacing(dp(2).toFloat(), 1f) }, top)
 
     private fun panel(radius: Int = 18) = column().apply {
-        background = glassSurface(palette, radius)
+        background = panelSurface(palette, radius)
         setPadding(dp(15), dp(10), dp(15), dp(10))
     }
 
@@ -2534,7 +2735,7 @@ class MainActivity : ComponentActivity() {
         val disabled = intArrayOf(-android.R.attr.state_enabled)
         background = android.graphics.drawable.StateListDrawable().apply {
             addState(disabled, shape(palette.background, 13, palette.border))
-            val surface = if (filled) accentAction(bg, 13) else glassSurface(palette, 13, accent)
+            val surface = if (filled) shape(bg, 13) else panelSurface(palette, 13, accent)
             addState(intArrayOf(), pressable(surface, fg, 13))
         }
         setTextColor(ColorStateList(arrayOf(disabled, intArrayOf()), intArrayOf(palette.muted, fg)))

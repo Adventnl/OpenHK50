@@ -40,24 +40,32 @@ On Windows use `gradlew.bat`; keep the Rust tools on `PATH`. The APK supports An
 1. On the Android phone, open **Band → Scan for bands**, allow nearby device access, and select your band, for example **HK50_3806**. Disconnect it in QWatch Pro or nRF Connect before scanning if either app is using it.
 2. Open **Today → Daily activity** for estimated total calorie burn and charts by time of day. Use the date control to see past days. Tap **Today’s steps** to open the current day in Steps history. **Goals** sets targets and **Average sleep** opens the previous seven complete days.
 3. Open **Workouts**, tap **Start workout**, and choose an activity. Use **Pause**, **Resume**, or **End workout**. The session survives app restarts. Saved sessions show active duration and average heart rate when the band supplies readings during the workout. A configured personal build shows estimated active calories during and after Strength sessions.
-4. To check your pulse, tap **Health → Measure heart rate**. Keep your wrist still while the band measures. Tap **Stop** to end the check early. Automatic heart-rate logging defaults to **On demand** and can be enabled under **Band → Heart-rate logging**.
-5. **Band → Sync now** fetches today and checks for yesterday’s activity. **Sync past 7 days** requests recent history. Turn off **Auto-sync** to sync manually. HK50 devices with the detail channel try sleep and oxygen sync directly. For H59 or firmware that requires sign-in, enter the linked QWatch username under Band settings. The app stores the username on the phone and sends it over BLE.
+4. To check your pulse, tap **Health → Measure heart rate**. Keep your wrist still while the band measures. The check continues when you leave the screen. Tap **Stop** in the app or its notification to end it early. **Today** shows the latest reading. New pairings ask the band to log every 15 minutes. Change this under **Band → Heart-rate logging**.
+5. **Band → Sync now** fetches today and checks for recent overnight and activity readings. **Sync past 7 days** requests recent history. Turn off **Auto-sync** to sync manually. HK50 devices with the detail channel try sleep and oxygen sync directly. For H59 or firmware that requires sign-in, enter the linked QWatch username under Band settings. The app stores the username on the phone and sends it over BLE.
 6. Open **Band → Phone vibration**. Grant notification access and switch on the apps you want to buzz. **Incoming calls** uses phone access and repeats the buzz while a cellular call rings. **Band → Privacy** shows Android permission and notification access status.
 7. **Band → Tools** includes **Find band** and **Phone clock**. **Camera remote** takes a photo when you move your wrist with the band connected or tap **Take photo**. It offers a three-second timer and front or rear camera selection when available. Photos save to `Pictures/OpenHK50` on Android 10 or later and to app storage on Android 8–9. The **Band call alerts** switch relays incoming cellular calls while the band service is running.
 
-The band reconnects while the app is open or band call alerts are running. With **Auto-sync** on, it imports history after connecting and roughly every five minutes while idle. Pair in the time zone used by the band clock.
+The band reconnects while the app is open or band call alerts are running. Its automatic heart-rate logging works independently of the phone. With **Auto-sync** on, it imports history after connecting and roughly every five minutes while idle. Pair in the time zone used by the band clock.
+
+### Activity calibration and health insights
+
+Use **Band → Calibrate steps** with the change in the band’s count and your own count from the same walk. The calibration applies to displayed step totals, charts, and goals for that band. On HK50, Today uses the band’s daily counter. The time-of-day chart uses the stored intervals.
+
+**Health** shows daily metric histories, sleep stages, recovery and strain. Recovery compares sleeping HRV and heart rate with the median of at least seven complete nights over the previous 28 days and includes sleep duration. Strain summarizes sustained elevation above the sleeping heart-rate baseline and requires at least 30 minutes of sample coverage. The scores use locally stored data and remain blank when coverage is insufficient.
+
+**Health → ECG** opens a locally imported waveform. Import an Apple Watch ECG CSV or a CSV with the header `time_ms,mv`. Each import replaces the saved waveform. Manual spot checks and HRV cannot supply ECG voltages.
 
 ### Daily calorie burn
 
-In **Daily activity → Resting calories**, enter daily basal calories or estimate them from weight and body fat with the [Cunningham equation](https://pubmed.ncbi.nlm.nih.gov/7435418/). A configured personal build supplies the starting estimate. The app saves the resulting BMR on the phone and applies it to all dates until you change it.
+In **Daily activity → Resting calories**, enter daily basal calories or estimate them from weight and body fat with the [Cunningham equation](https://pubmed.ncbi.nlm.nih.gov/7435418/). A configured personal build supplies the starting estimate or the BMR listed on a body-composition report. The app saves the resulting BMR on the phone and applies it to all dates until you change it.
 
 The total adds the band's calorie reading to estimated resting calories at your BMR rate from local midnight, through now for today or through the next midnight for earlier dates. Both readings are required. The band’s calorie calculation and accuracy are unverified. Workout estimates are separate to avoid counting activity twice.
 
 ### Personal Strength estimates
 
-Set `openhk50.workout.weightKg` and `openhk50.workout.bodyFatPercent` in `android/local.properties`, then rebuild. Use a percentage such as `20` for 20% body fat. The file is ignored by Git. The personal values are embedded in the resulting APK.
+Set `openhk50.workout.weightKg` and `openhk50.workout.bodyFatPercent` in `android/local.properties`, then rebuild. You can also set `openhk50.workout.basalKcalPerDay` to use the BMR listed on a report. Use a percentage such as `20` for 20% body fat. The file is ignored by Git. The personal values are embedded in the resulting APK.
 
-Android estimates active calories from logged duration excluding pauses. It uses the [Adult Compendium’s 3.5 MET value for resistance training](https://pacompendium.com/conditioning-exercise/) and subtracts your estimated basal energy for the same time using the Cunningham equation. Saved Strength sessions use the current build’s profile.
+Android estimates active calories from logged duration excluding pauses. It uses the [Adult Compendium’s 3.5 MET value for resistance training](https://pacompendium.com/conditioning-exercise/) and subtracts basal energy for the same time using the configured BMR or the Cunningham estimate. Saved Strength sessions use the current build’s profile.
 
 The [HK50 Bluetooth reference](docs/reference/HK50.md) records verified features, gesture and vibration commands, and the GATT inventory. The [H59 protocol reference](docs/reference/OpenH59.md) covers the related firmware. Historical oxygen values are hourly maxima. For a manual nRF Connect check, subscribe to `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` and write the hex battery request `03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03` to `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`. In a valid `03` response the next byte is the percentage.
 

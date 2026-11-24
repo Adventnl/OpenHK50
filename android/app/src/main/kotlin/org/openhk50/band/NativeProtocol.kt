@@ -12,6 +12,7 @@ internal object NativeProtocol {
     const val STRESS_HISTORY = 55
     const val HRV_HISTORY = 57
     const val STEPS = 67
+    const val TODAY_ACTIVITY = 72
     const val LIVE = 105
     const val LIVE_STOP = 106
     const val CAMERA = 2

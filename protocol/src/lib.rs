@@ -103,6 +103,10 @@ pub fn step_intervals(frames: &[u8], date: u32) -> Vec<Interval> {
 
 #[cfg(feature = "activity")]
 pub fn activity_intervals(frames: &[u8], date: u32) -> Vec<ActivityInterval> {
+    let uses_milli_kcal = frames
+        .chunks_exact(FRAME_LEN)
+        .find(|frame| valid(frame) && frame[..2] == [STEPS, 0xf0])
+        .is_some_and(|frame| frame[3] == 0);
     let mut slots = [None; 96];
     for (slot, frame) in step_packets(frames, date) {
         let mut values = slots[slot].unwrap_or(ActivityInterval {
@@ -112,7 +116,15 @@ pub fn activity_intervals(frames: &[u8], date: u32) -> Vec<ActivityInterval> {
             distance: None,
         });
         values.steps = activity_field(frame, 9).or(values.steps);
-        values.calories = activity_field(frame, 7).or(values.calories);
+        values.calories = activity_field(frame, 7)
+            .map(|value| {
+                if uses_milli_kcal {
+                    ((u32::from(value) + 5) / 10) as u16
+                } else {
+                    value
+                }
+            })
+            .or(values.calories);
         values.distance = activity_field(frame, 11).or(values.distance);
         slots[slot] = Some(values);
     }
@@ -196,5 +208,15 @@ mod tests {
                 distance: Some(99),
             }]
         );
+    }
+    #[cfg(feature = "activity")]
+    #[test]
+    fn activity_normalizes_legacy_milli_kcal_to_centi_kcal() {
+        let header = encode(STEPS, &[0xf0, 1, 0]).unwrap();
+        let payload = [0x26, 0x11, 0x21, 5, 0, 1, 0x57, 0x04, 40, 0, 99, 0];
+        let record = encode(STEPS, &payload).unwrap();
+        let intervals = activity_intervals(&[header, record].concat(), 20261121);
+        assert_eq!(intervals[0].calories, Some(111));
+        assert_eq!(intervals[0].steps, Some(40));
     }
 }

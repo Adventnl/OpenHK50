@@ -4,6 +4,7 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
@@ -14,6 +15,7 @@ import android.graphics.RuntimeShader
 import android.graphics.Shader
 import android.os.Build
 import android.view.View
+import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import androidx.annotation.RequiresApi
@@ -28,7 +30,8 @@ internal class GlassNavigation(
     context: Context, private val palette: Palette, private val source: View, radius: Int
 ) : FrameLayout(context) {
     private val corner = context.dp(radius).toFloat()
-    private val tint = context.glassSurface(palette, radius, floating = true)
+    private val tint = context.shape(if (palette.night) 0x99121821.toInt() else 0x9feef5ff.toInt(),
+        radius, if (palette.night) 0x65e1eeff else 0xccffffff.toInt())
     private val clip = Path()
     private val bounds = RectF()
     private val lens = RectF()
@@ -39,6 +42,8 @@ internal class GlassNavigation(
     private var selected: View? = null
     private var motion: ValueAnimator? = null
     private var accent = palette.brand
+    private var previousAccent = accent
+    private var targetAccent = accent
     private var glow = 0f
     private var slide = false
 
@@ -55,7 +60,7 @@ internal class GlassNavigation(
     fun select(cell: View, color: Int, animate: Boolean) {
         if (selected === cell) return
         selected = cell
-        accent = color
+        targetAccent = color
         slide = animate && !lens.isEmpty && ValueAnimator.areAnimatorsEnabled()
         requestLayout()
         invalidate()
@@ -81,21 +86,30 @@ internal class GlassNavigation(
             slide = false
             motion?.cancel()
             from.set(lens)
+            previousAccent = accent
             motion = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 420
-                interpolator = arrive
+                duration = 470
+                interpolator = LinearInterpolator()
+                val horizontal = kotlin.math.abs(to.centerX() - from.centerX()) >=
+                    kotlin.math.abs(to.centerY() - from.centerY())
+                val forward = if (horizontal) to.centerX() >= from.centerX() else to.centerY() >= from.centerY()
                 addUpdateListener {
                     val t = it.animatedFraction
-                    val stretch = 1f - kotlin.math.abs(2f * t - 1f)
-                    val x = (to.centerX() - from.centerX()) * .14f * stretch
-                    val y = (to.centerY() - from.centerY()) * .14f * stretch
+                    val front = arrive.getInterpolation((t / .76f).coerceAtMost(1f))
+                    val tail = arrive.getInterpolation(((t - .13f) / .87f).coerceIn(0f, 1f))
+                    val near = if (forward) tail else front
+                    val far = if (forward) front else tail
+                    val middle = (front + tail) / 2
+                    glow = (front - tail).coerceAtLeast(0f)
                     lens.set(
-                        mix(from.left, to.left, t) + minOf(0f, x),
-                        mix(from.top, to.top, t) + minOf(0f, y),
-                        mix(from.right, to.right, t) + maxOf(0f, x),
-                        mix(from.bottom, to.bottom, t) + maxOf(0f, y)
+                        mix(from.left, to.left, if (horizontal) near else middle),
+                        mix(from.top, to.top, if (horizontal) middle else near),
+                        mix(from.right, to.right, if (horizontal) far else middle),
+                        mix(from.bottom, to.bottom, if (horizontal) middle else far)
                     )
-                    glow = stretch
+                    val pinch = context.dp(5) * glow
+                    lens.inset(if (horizontal) 0f else pinch, if (horizontal) pinch else 0f)
+                    accent = ColorUtils.blendARGB(previousAccent, targetAccent, middle)
                     invalidate()
                 }
                 start()
@@ -103,6 +117,7 @@ internal class GlassNavigation(
         } else if (motion?.isRunning != true || changed) {
             motion?.cancel()
             lens.set(to)
+            accent = targetAccent
             glow = 0f
         }
     }
@@ -110,7 +125,7 @@ internal class GlassNavigation(
     override fun onDraw(canvas: Canvas) {
         canvas.withClip(clip) {
             if (Build.VERSION.SDK_INT >= 31 && isHardwareAccelerated && source.isLaidOut) {
-                backdrop?.draw(this, source, source.x - x, source.y - y, palette.background)
+                backdrop?.draw(this, source, source.x - x, source.y - y, palette.background, lens, glow)
             }
             tint.draw(this)
             if (!lens.isEmpty) drawLens(this)
@@ -121,7 +136,7 @@ internal class GlassNavigation(
         val round = lens.height() / 2f
         paint.style = Paint.Style.FILL
         paint.shader = LinearGradient(lens.left, lens.top, lens.right, lens.bottom, intArrayOf(
-            ColorUtils.setAlphaComponent(accent, if (palette.night) 72 else 48),
+            ColorUtils.setAlphaComponent(accent, if (palette.night) 78 else 60),
             ColorUtils.setAlphaComponent(accent, if (palette.night) 31 else 22),
             ColorUtils.setAlphaComponent(accent, if (palette.night) 48 else 36)
         ), floatArrayOf(0f, .55f, 1f), Shader.TileMode.CLAMP)
@@ -129,8 +144,8 @@ internal class GlassNavigation(
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = context.dp(1).toFloat()
         paint.shader = LinearGradient(lens.left, lens.top, lens.right, lens.bottom, intArrayOf(
-            ColorUtils.setAlphaComponent(android.graphics.Color.WHITE, (105 + 95 * glow).roundToInt()),
-            ColorUtils.setAlphaComponent(accent, 55),
+            ColorUtils.setAlphaComponent(Color.WHITE, (105 + 95 * glow).roundToInt()),
+            ColorUtils.setAlphaComponent(accent, 95),
             ColorUtils.setAlphaComponent(accent, 130)
         ), null, Shader.TileMode.CLAMP)
         canvas.drawRoundRect(lens, round, round, paint)
@@ -148,7 +163,10 @@ internal class GlassNavigation(
     @RequiresApi(31)
     private class Backdrop(context: Context, private val corner: Float) {
         private val node = RenderNode("Navigation backdrop")
-        private val spread = context.dp(4).toFloat()
+        private val spread = context.dp(3).toFloat()
+        private var shader: RuntimeShader? = null
+        private val lastLens = RectF()
+        private var lastStretch = -1f
 
         fun resize(width: Int, height: Int) {
             node.setPosition(0, 0, width, height)
@@ -157,12 +175,21 @@ internal class GlassNavigation(
                 glass.setFloatUniform("size", width.toFloat(), height.toFloat())
                 glass.setFloatUniform("radius", corner)
                 glass.setFloatUniform("spread", spread)
+                shader = glass
+                lastStretch = -1f
                 RenderEffect.createRuntimeShaderEffect(glass, "scene")
             } else RenderEffect.createBlurEffect(spread, spread, Shader.TileMode.CLAMP)
             node.setRenderEffect(effect)
         }
 
-        fun draw(canvas: Canvas, source: View, x: Float, y: Float, background: Int) {
+        fun draw(canvas: Canvas, source: View, x: Float, y: Float, background: Int, lens: RectF, stretch: Float) {
+            if (Build.VERSION.SDK_INT >= 33 && (lastStretch != stretch || lastLens != lens)) shader?.let {
+                lastLens.set(lens)
+                lastStretch = stretch
+                it.setFloatUniform("lens", lens.centerX(), lens.centerY(), lens.width() / 2, lens.height() / 2)
+                it.setFloatUniform("stretch", stretch)
+                node.setRenderEffect(RenderEffect.createRuntimeShaderEffect(it, "scene"))
+            }
             val recording = node.beginRecording()
             try {
                 recording.drawColor(background)
@@ -181,6 +208,8 @@ internal class GlassNavigation(
             uniform float2 size;
             uniform float radius;
             uniform float spread;
+            uniform float4 lens;
+            uniform float stretch;
 
             half4 main(float2 p) {
                 float r = min(radius, min(size.x, size.y) * .5);
@@ -188,9 +217,16 @@ internal class GlassNavigation(
                 float2 edge = max(abs(c) - (size * .5 - r), 0.0);
                 float rim = smoothstep(r - spread * 5.0, r, length(edge));
                 float2 q = p - normalize(c + float2(.001)) * spread * 2.5 * rim;
-                return scene.eval(q) * .36 +
+                float2 halfLens = max(lens.zw, 1.0);
+                float lensRadius = min(halfLens.x, halfLens.y);
+                float2 local = p - lens.xy;
+                float2 box = abs(local) - halfLens + lensRadius;
+                float sdf = length(max(box, 0.0)) + min(max(box.x, box.y), 0.0) - lensRadius;
+                float lensEdge = smoothstep(-spread * 4.0, 0.0, sdf) * (1.0 - smoothstep(0.0, spread, sdf));
+                q -= normalize(local + float2(.001)) * spread * (1.6 + stretch * 2.4) * lensEdge;
+                return scene.eval(q) * .44 +
                     (scene.eval(q + float2(spread, 0.0)) + scene.eval(q - float2(spread, 0.0)) +
-                     scene.eval(q + float2(0.0, spread)) + scene.eval(q - float2(0.0, spread))) * .16;
+                     scene.eval(q + float2(0.0, spread)) + scene.eval(q - float2(0.0, spread))) * .14;
             }
         """
     }

@@ -4,19 +4,36 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import androidx.core.content.edit
 import java.time.LocalDate
 import java.time.ZoneId
 
-class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 5) {
+class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3", null, 6) {
     internal data class Day(
         private val readings: Map<Metric, List<Aggregate>>, val sleep: SleepNight?, val earlier: Boolean,
-        val spot: Long? = null
+        val spot: Long? = null, private val activity: BandActivity? = null, private val stepFactor: Double = 1.0
     ) {
-        fun buckets(metric: Metric) = readings[metric].orEmpty().map { it.value(metric.isTotal) }
-        fun value(metric: Metric) = readings[metric].orEmpty().combined().value(metric.isTotal)
+        fun buckets(metric: Metric) = readings[metric].orEmpty().map { metricValue(it, metric) }
+        fun value(metric: Metric): Long? = when (metric) {
+            Metric.STEPS -> activity?.steps?.let { metric.fromActivityStorage(it, stepFactor) }
+            Metric.CALORIES -> activity?.milliKcal?.let { (it + 500) / 1000 }
+            Metric.DISTANCE -> activity?.meters
+            else -> null
+        } ?: metricValue(readings[metric].orEmpty().combined(), metric)
+
+        private fun metricValue(bucket: Aggregate, metric: Metric) =
+            bucket.value(metric.isTotal)?.let { metric.fromActivityStorage(it, stepFactor) }
     }
     internal data class Trend(val buckets: List<Aggregate>, val earlier: Boolean)
     data class Checkpoint(val store: String, val cursor: Long)
+
+    private val calibration = context.getSharedPreferences("activity_calibration", Context.MODE_PRIVATE)
+
+    internal fun stepFactor(band: String) = calibration.getFloat(band, 1f).toDouble()
+
+    internal fun setStepFactor(band: String, factor: Double?) {
+        calibration.edit { if (factor == null) remove(band) else putFloat(band, factor.toFloat()) }
+    }
 
     init { setWriteAheadLoggingEnabled(true) }
 
@@ -40,6 +57,7 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         createSleepTable(db)
         createWorkoutTable(db)
         createWorkoutPauses(db)
+        createActivityTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -56,7 +74,30 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
             }
         }
         if (oldVersion < 5) createWorkoutPauses(db)
+        if (oldVersion < 6) createActivityTable(db)
     }
+
+    private fun createActivityTable(db: SQLiteDatabase) = db.execSQL("""
+        CREATE TABLE activity_snapshot (
+            band TEXT PRIMARY KEY, day TEXT NOT NULL, steps INTEGER NOT NULL,
+            milli_kcal INTEGER NOT NULL, meters INTEGER NOT NULL
+        ) WITHOUT ROWID
+    """.trimIndent())
+
+    internal fun saveActivitySnapshot(band: String, date: LocalDate, activity: BandActivity) {
+        writableDatabase.replaceOrThrow("activity_snapshot", null, ContentValues(5).apply {
+            put("band", band)
+            put("day", date.toString())
+            put("steps", activity.steps)
+            put("milli_kcal", activity.milliKcal)
+            put("meters", activity.meters)
+        })
+    }
+
+    private fun activitySnapshot(db: SQLiteDatabase, band: String, date: LocalDate) = db.rawQuery(
+        "SELECT steps, milli_kcal, meters FROM activity_snapshot WHERE band=? AND day=?",
+        arrayOf(band, date.toString())
+    ).use { if (it.moveToFirst()) BandActivity(it.getLong(0), it.getLong(1), it.getLong(2)) else null }
 
     private fun createSleepTable(db: SQLiteDatabase) = db.execSQL("""
         CREATE TABLE sleep_nights (
@@ -208,7 +249,69 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
             """.trimIndent(), arrayOf(band, it.name, bounds.first().toString(), bounds.last().toString()))
                 .use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else null }
         }
-        return Day(series, sleep, earlier, spot)
+        val activity = if (wantsReadings && date == LocalDate.now(zone)) activitySnapshot(db, band, date) else null
+        return Day(series, sleep, earlier, spot, activity, stepFactor(band))
+    }
+
+    internal fun latestHeart(selected: String?): HeartSample? {
+        val db = readableDatabase
+        val band = selected ?: latestBand(db) ?: return null
+        return db.rawQuery("""
+            SELECT time_ms, value, origin FROM readings WHERE band=? AND kind='HEART'
+            ORDER BY time_ms DESC, origin DESC LIMIT 1
+        """.trimIndent(), arrayOf(band)).use {
+            if (it.moveToFirst()) HeartSample(it.getLong(0), it.getInt(1), it.getString(2) == Origin.LIVE.name)
+            else null
+        }
+    }
+
+    internal fun insights(selected: String?, date: LocalDate, zone: ZoneId): HealthInsights? {
+        val db = readableDatabase
+        val band = selected ?: latestBand(db) ?: return null
+        val start = date.atStartOfDay(zone).toInstant().toEpochMilli()
+        val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val firstDay = date.minusDays(28)
+        val since = firstDay.minusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val samples = db.rawQuery("""
+            SELECT kind, time_ms, value FROM readings
+            WHERE band=? AND kind IN ('HEART','HRV') AND origin='HISTORY' AND time_ms>=? AND time_ms<?
+            ORDER BY time_ms
+        """.trimIndent(), arrayOf(band, since.toString(), end.toString())).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(Metric.valueOf(cursor.getString(0)) to HeartSample(cursor.getLong(1), cursor.getInt(2)))
+                }
+            }.groupBy({ it.first }, { it.second })
+        }
+        val heart = samples[Metric.HEART].orEmpty()
+        val hrv = samples[Metric.HRV].orEmpty()
+        val nights = db.rawQuery("""
+            SELECT day, start_minute, segments FROM sleep_nights WHERE band=? AND day BETWEEN ? AND ?
+        """.trimIndent(), arrayOf(band, firstDay.toString(), date.toString())).use { cursor ->
+            buildMap {
+                while (cursor.moveToNext()) {
+                    val day = LocalDate.parse(cursor.getString(0))
+                    val startMinute = cursor.getInt(1)
+                    val segments = decodeSleep(cursor.getBlob(2))
+                    val asleep = segments.filter { it.stage != SleepStage.AWAKE }.sumOf { it.minutes }
+                    val spansMidnight = startMinute + segments.sumOf { it.minutes } > 1440
+                    val nightStart = if (spansMidnight) day.minusDays(1) else day
+                    var minute = startMinute.toLong()
+                    val windows = segments.mapNotNull { segment ->
+                        val from = nightStart.atStartOfDay().plusMinutes(minute).atZone(zone).toInstant().toEpochMilli()
+                        minute += segment.minutes
+                        val to = nightStart.atStartOfDay().plusMinutes(minute).atZone(zone).toInstant().toEpochMilli()
+                        (from until to).takeIf { segment.stage != SleepStage.AWAKE }
+                    }
+                    fun medianAsleep(series: List<HeartSample>, minimum: Int) = series.filter { sample ->
+                        windows.any { sample.time in it }
+                    }.map { it.bpm }.takeIf { it.size >= minimum }?.median()
+                    put(day, NightVitals(asleep, medianAsleep(heart, 3), medianAsleep(hrv, 2)))
+                }
+            }
+        }
+        return calculateInsights(nights[date], nights.filterKeys { it < date }.values.toList(),
+            heart.filter { it.time in start until end })
     }
 
     internal fun trend(selected: String?, dates: List<LocalDate>, end: LocalDate, zone: ZoneId, metric: Metric?): Trend {
@@ -216,8 +319,32 @@ class HealthStore(context: Context) : SQLiteOpenHelper(context, "health.sqlite3"
         val band = selected ?: latestBand(db) ?: return Trend(List(dates.size) { Aggregate() }, false)
         val days = dates + end.plusDays(1)
         val bounds = days.map { it.atStartOfDay(zone).toInstant().toEpochMilli() }
-        val buckets = if (metric == null) sleepBuckets(db, band, days) else readingBuckets(db, band, bounds, metric)[metric]
-        return Trend(buckets ?: List(dates.size) { Aggregate() }, earlier(db, band, dates.first(), bounds.first(), metric))
+        val buckets = if (metric == null) sleepBuckets(db, band, days) else activityBuckets(db, band, days, bounds, metric, zone)
+        return Trend(buckets, earlier(db, band, dates.first(), bounds.first(), metric))
+    }
+
+    private fun activityBuckets(
+        db: SQLiteDatabase, band: String, days: List<LocalDate>, bounds: List<Long>, metric: Metric, zone: ZoneId
+    ): List<Aggregate> {
+        val raw = readingBuckets(db, band, bounds, metric)[metric]?.toMutableList()
+            ?: MutableList(days.size - 1) { Aggregate() }
+        val today = LocalDate.now(zone)
+        val dayIndex = days.zipWithNext().indexOfFirst { (from, until) -> today >= from && today < until }
+        if (metric.isTotal && dayIndex >= 0) activitySnapshot(db, band, today)?.let { current ->
+            val past = if (days[dayIndex] == today) Aggregate() else {
+                val midnight = today.atStartOfDay(zone).toInstant().toEpochMilli()
+                readingBuckets(db, band, listOf(bounds[dayIndex], midnight), metric)[metric]?.firstOrNull() ?: Aggregate()
+            }
+            val total = when (metric) {
+                Metric.STEPS -> current.steps
+                Metric.CALORIES -> (current.milliKcal + 5) / 10
+                Metric.DISTANCE -> current.meters
+                else -> error("Expected an activity metric")
+            }
+            raw[dayIndex] = past + Aggregate(total, 1)
+        }
+        val factor = stepFactor(band)
+        return raw.map { it.copy(sum = metric.fromActivityStorage(it.sum, factor)) }
     }
 
     private fun readingBuckets(db: SQLiteDatabase, band: String, bounds: List<Long>, metric: Metric?): Map<Metric, List<Aggregate>> {

@@ -17,6 +17,7 @@ import org.openhk50.band.NativeProtocol.LIVE
 import org.openhk50.band.NativeProtocol.LIVE_STOP
 import org.openhk50.band.NativeProtocol.STEPS
 import org.openhk50.band.NativeProtocol.STRESS_HISTORY
+import org.openhk50.data.BandActivity
 import org.openhk50.data.Metric
 import org.openhk50.data.Reading
 import org.openhk50.data.SleepNight
@@ -41,6 +42,7 @@ data class BandState(
     val battery: Int? = null,
     val charging: Boolean = false,
     val measurement: Metric? = null,
+    val queuedMeasurement: Metric? = null,
     val liveValue: Int? = null,
     val measurementStopping: Boolean = false,
     val measurementMessage: String? = null,
@@ -60,7 +62,8 @@ data class BandState(
 internal class BandClient(
     private val context: Context,
     private val save: (List<Reading>) -> Unit,
-    private val saveSleep: (String, List<SleepNight>) -> Unit
+    private val saveSleep: (String, List<SleepNight>) -> Unit,
+    private val saveActivity: (String, LocalDate, BandActivity) -> Unit
 ) : GattLink.Events {
     private val main = Handler(Looper.getMainLooper())
     private val prefs = context.getSharedPreferences("band", Context.MODE_PRIVATE)
@@ -69,7 +72,9 @@ internal class BandClient(
     private val reconnectJob = Runnable { autoConnect() }
     private var foreground = false
     private var keepConnected = false
-    private val connectionNeeded get() = foreground || keepConnected
+    val spotCheckPending get() = state.queuedMeasurement != null || state.action == BandAction.MEASURING
+    private val connectionNeeded get() = foreground || keepConnected || spotCheckPending
+    var spotCheckChanged: (() -> Unit)? = null
     private var retryConnection = false
     private var autoReconnect = prefs.getBoolean("autoReconnect", true)
     var autoSync = prefs.getBoolean("autoSync", true)
@@ -80,6 +85,7 @@ internal class BandClient(
     private var detailTransfer: DetailTransfer? = null
     private var deadline: Runnable? = null
     private var liveSamples: SpotSamples? = null
+    private var lastBeatInterval: Int? = null
     private var stopRequested = false
     private var shutter: (() -> Unit)? = null
     private var cameraClosing = false
@@ -99,7 +105,7 @@ internal class BandClient(
     })
         private set
 
-    private class Exchange(val command: Int, val completion: (Exchange) -> Unit) {
+    private class Exchange(val command: Int, val subcommand: Int, val completion: (Exchange) -> Unit) {
         val frames = arrayListOf<ByteArray>()
         var written = false
         var rejected = false
@@ -129,6 +135,7 @@ internal class BandClient(
     private fun publish(next: BandState) {
         state = next
         changed?.invoke()
+        spotCheckChanged?.invoke()
     }
 
     fun foreground(active: Boolean) {
@@ -191,8 +198,12 @@ internal class BandClient(
         reopenAfterMeasurement = false
         cameraClosing = false
         closeAfterCamera = false
+        val interrupted = state.queuedMeasurement ?: state.measurement.takeIf { state.action == BandAction.MEASURING }
         publish(state.copy(connection = Connection.DISCONNECTED, connecting = null, action = BandAction.IDLE,
-            battery = null, charging = false, liveValue = null, measurementStopping = false, detailSyncAvailable = false,
+            battery = null, charging = false, queuedMeasurement = null, measurementStopping = false, detailSyncAvailable = false,
+            measurement = interrupted ?: state.measurement,
+            liveValue = state.liveValue.takeIf { interrupted == null },
+            measurementMessage = if (interrupted != null) message ?: "Reconnect the band and try again." else state.measurementMessage,
             cameraActive = false, cameraIssue = null, message = message))
     }
 
@@ -247,15 +258,12 @@ internal class BandClient(
             detailUsernameSet = usernameSet, message = null)
         sendCallAlert()
         publish(state.copy(action = BandAction.SETTING, automaticHeartLogging = null))
-        val logging = prefs.getBoolean(loggingKey(device), false)
-        request(NativeProtocol.packet(HEART_LOG, 1), 1_500) { result ->
-            val current = result.frames.firstOrNull()?.get(2)?.toInt()
-            if (current == if (logging) 1 else 2) {
-                state = state.copy(automaticHeartLogging = logging)
+        val logging = prefs.getBoolean(loggingKey(device), true)
+        readLogging { current ->
+            if (current == logging) {
+                state = state.copy(automaticHeartLogging = current)
                 beginConnectedSync()
-            } else {
-                writeLogging(logging, ::beginConnectedSync)
-            }
+            } else writeLogging(logging, ::beginConnectedSync)
         }
     }
 
@@ -306,33 +314,47 @@ internal class BandClient(
     }
 
     private fun importDay(device: BandDevice, today: LocalDate, offset: Int) {
-        if (offset >= state.days) {
-            val yesterday = today.minusDays(1)
-            if (state.days == 1 && lastSyncedYesterday != yesterday) {
-                importActivity(device, today, 1) { received ->
-                    if (received) lastSyncedYesterday = yesterday
-                    finishImport(device, today)
-                }
-            } else finishImport(device, today)
+        val yesterday = today.minusDays(1)
+        val days = if (state.days == 1 && lastSyncedYesterday != yesterday) 2 else state.days
+        if (offset >= days) {
+            finishImport(device, today)
             return
         }
-        publish(state.copy(progress = offset + 1))
+        publish(state.copy(progress = (offset + 1).coerceAtMost(state.days)))
         val day = today.minusDays(offset.toLong())
         request(NativeProtocol.heartRequest(day), 3_500) { heart ->
-            if (!heart.rejected && heart.frames.isNotEmpty()) {
-                historyReceived = true
+            val heartAnswered = !heart.rejected && heart.frames.isNotEmpty()
+            if (heartAnswered) {
+                if (offset == 0 || state.days > 1) historyReceived = true
                 writeIntervals(device, Metric.HEART, day, NativeProtocol.heartIntervals(heart.frames))
             }
             if (!sameDay(today)) return@request
             importActivity(device, today, offset) { received ->
-                stepsReceived = stepsReceived || received
-                if (offset == 1 && received) lastSyncedYesterday = day
-                importSlots(device, today, offset, STRESS_HISTORY, Metric.STRESS) {
-                    importSlots(device, today, offset, HRV_HISTORY, Metric.HRV) {
-                        importDay(device, today, offset + 1)
+                if (offset == 0 || state.days > 1) stepsReceived = stepsReceived || received
+                importActivitySnapshot(device, today, offset) {
+                    importSlots(device, today, offset, STRESS_HISTORY, Metric.STRESS) {
+                        importSlots(device, today, offset, HRV_HISTORY, Metric.HRV) {
+                            if (offset == 1 && (heartAnswered || received)) lastSyncedYesterday = day
+                            importDay(device, today, offset + 1)
+                        }
                     }
                 }
             }
+        }
+    }
+
+    private fun importActivitySnapshot(device: BandDevice, today: LocalDate, offset: Int, done: () -> Unit) {
+        if (offset != 0 || !device.name.startsWith("HK50", ignoreCase = true)) {
+            done()
+            return
+        }
+        request(NativeProtocol.packet(NativeProtocol.TODAY_ACTIVITY), 1_100) { result ->
+            if (!sameDay(today)) return@request
+            result.frames.firstOrNull()?.let(BandActivity::fromHk50Summary)?.let { snapshot ->
+                saveActivity(device.address, today, snapshot)
+                stepsReceived = true
+            }
+            done()
         }
     }
 
@@ -443,14 +465,33 @@ internal class BandClient(
         }
     }
 
-    fun measure(metric: Metric) {
+    fun queueMeasurement(metric: Metric) {
+        if (state.connection != Connection.CONNECTED || spotCheckPending || metric.liveType == null) return
+        publish(state.copy(queuedMeasurement = metric, measurementMessage = null))
+    }
+
+    fun startQueuedMeasurement() {
+        val metric = state.queuedMeasurement ?: return
+        if (spotCheckChanged == null) return
+        measure(metric)
+    }
+
+    fun measurementStartFailed() {
+        val metric = state.queuedMeasurement ?: return
+        publish(state.copy(queuedMeasurement = null, measurement = metric, liveValue = null,
+            measurementMessage = "Couldn’t start the spot check. Open the app and try again."))
+        if (!connectionNeeded) endConnection()
+    }
+
+    private fun measure(metric: Metric) {
         availableDevice() ?: return
         val type = metric.liveType ?: return
         main.removeCallbacks(refresh)
         liveSamples = SpotSamples(metric)
+        lastBeatInterval = null
         stopRequested = false
         closingAfterMeasurement = false
-        publish(state.copy(action = BandAction.MEASURING, measurement = metric, liveValue = null,
+        publish(state.copy(action = BandAction.MEASURING, queuedMeasurement = null, measurement = metric, liveValue = null,
             measurementStopping = false, measurementMessage = null))
         val timeout = if (metric == Metric.HEART) 60_000L else 30_000L
         request(NativeProtocol.packet(LIVE, type, 1), timeout) { result ->
@@ -465,6 +506,11 @@ internal class BandClient(
     }
 
     fun stopMeasurement() {
+        if (state.queuedMeasurement != null) {
+            publish(state.copy(queuedMeasurement = null))
+            if (!connectionNeeded) endConnection()
+            return
+        }
         val current = exchange ?: return
         if (current.command != LIVE) return
         val metric = state.measurement ?: return
@@ -511,10 +557,24 @@ internal class BandClient(
         }
     }
 
+    private fun readLogging(done: (Boolean?) -> Unit) {
+        request(NativeProtocol.packet(HEART_LOG, 1), 1_500) { result ->
+            val frame = result.frames.firstOrNull()
+            done(when {
+                frame == null || result.rejected -> null
+                frame[2].toInt() == 2 -> false
+                frame[2].toInt() == 1 && frame[3].toInt() == HEART_INTERVAL_MINUTES -> true
+                else -> null
+            })
+        }
+    }
+
     private fun writeLogging(enabled: Boolean, done: () -> Unit) {
-        request(NativeProtocol.packet(HEART_LOG, 2, if (enabled) 1 else 2, 5), 1_500) { result ->
-            state = state.copy(automaticHeartLogging = enabled.takeIf { !result.rejected && result.frames.isNotEmpty() })
-            done()
+        request(NativeProtocol.packet(HEART_LOG, 2, if (enabled) 1 else 2, HEART_INTERVAL_MINUTES), 1_500) {
+            readLogging { confirmed ->
+                state = state.copy(automaticHeartLogging = confirmed.takeIf { it == enabled })
+                done()
+            }
         }
     }
 
@@ -612,11 +672,16 @@ internal class BandClient(
             main.postDelayed(refresh, 5 * 60_000L)
         }
         publish(state.copy(action = BandAction.IDLE, message = message))
+        if (!connectionNeeded) {
+            closeLink(message)
+            return
+        }
+        startQueuedMeasurement()
         startCamera()
     }
 
     private fun request(packet: ByteArray, wait: Long, done: (Exchange) -> Unit) {
-        val current = Exchange(packet[0].toInt() and 255, done)
+        val current = Exchange(packet[0].toInt() and 255, packet[1].toInt() and 255, done)
         exchange = current
         link.write(packet, withResponse = current.command in ACKNOWLEDGED_WRITES) { ok ->
             if (exchange != current) return@write
@@ -652,25 +717,29 @@ internal class BandClient(
                     val metric = state.measurement ?: return
                     if (sub != metric.liveType || stopRequested) return
                     val error = header ushr 8 and 255
-                    val value = header and 255
                     if (error != 0) {
                         current.rejected = true
                         current.terminal = true
                     } else {
                         val samples = liveSamples ?: return
-                        if (samples.add(value)) {
+                        val hk50 = state.device?.name?.startsWith("HK50", ignoreCase = true) == true
+                        val sample = LiveMeasurement.decode(metric, bytes, hk50) ?: return
+                        if (sample.beatIntervalMs != null && sample.beatIntervalMs == lastBeatInterval) return
+                        lastBeatInterval = sample.beatIntervalMs
+                        if (samples.add(sample.value)) {
                             current.terminal = samples.complete
-                            if (state.liveValue != value) publish(state.copy(liveValue = value))
+                            if (state.liveValue != sample.value) publish(state.copy(liveValue = sample.value))
                         }
                     }
                 }
                 else -> {
                     if (command == BATTERY && sub > 100) return
+                    if (command == HEART_LOG && sub != current.subcommand) return
                     if (command == NativeProtocol.CAMERA && sub != 0) return
                     if (current.frames.size < 120) current.frames.add(bytes)
                     current.terminal = when (command) {
                         HEART_HISTORY -> sub == 23 || sub == 255
-                        STEPS -> sub == 255
+                        STEPS -> sub == 255 || activityTransferComplete(current.frames, bytes)
                         STRESS_HISTORY, HRV_HISTORY -> sub == 255 || current.frames.firstOrNull { it[1].toInt() == 0 }
                             ?.let { (it[2].toInt() and 255) <= sub + 1 } == true
                         else -> true
@@ -679,6 +748,17 @@ internal class BandClient(
             }
         }
         if (current.terminal && current.written) complete(current)
+    }
+
+    private fun activityTransferComplete(frames: List<ByteArray>, latest: ByteArray): Boolean {
+        val header = frames.first()
+        if (header[1].toInt() and 255 != 240 || latest[1].toInt() and 255 == 240) return false
+        val count = header[2].toInt() and 255
+        if (count !in 1..96 || (latest[5].toInt() and 255) != count - 1) return false
+        return frames.drop(1).mapNotNull { frame ->
+            val index = frame[5].toInt() and 255
+            index.takeIf { index < count && frame[6].toInt() and 255 == count }
+        }.toSet().size == count
     }
 
     private fun complete(current: Exchange) {
@@ -695,6 +775,7 @@ internal class BandClient(
     }
 
     companion object {
+        private const val HEART_INTERVAL_MINUTES = 15
         private val ACKNOWLEDGED_WRITES = setOf(LIVE, LIVE_STOP, NativeProtocol.CAMERA, NativeProtocol.PHONE_ALERT)
         fun permissions() = GattLink.permissions()
         fun hasPermissions(context: Context) = GattLink.hasPermissions(context)

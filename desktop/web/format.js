@@ -42,7 +42,7 @@ export function elapsed(seconds) {
 export const metrics = {
   heart: { name: 'Heart rate', unit: 'bpm', color: '#a34356', live: true, gap: 25 },
   steps: { name: 'Steps', unit: '', color: '#357560', total: true },
-  calories: { name: 'Band calories', unit: 'kcal', color: '#966334', total: true },
+  calories: { name: 'Band calories', unit: 'kcal', color: '#966334', total: true, scale: 0.01 },
   distance: { name: 'Distance', unit: 'km', color: '#527744', total: true, scale: 0.001 },
   oxygen: { name: 'Blood oxygen', unit: '%', color: '#317491', live: true, extra: true, gap: 65 },
   stress: { name: 'Stress', unit: '', color: '#82628c', live: true, extra: true, gap: 35 },
