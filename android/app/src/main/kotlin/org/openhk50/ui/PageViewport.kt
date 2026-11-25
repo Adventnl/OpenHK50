@@ -9,7 +9,7 @@ import android.widget.ScrollView
 
 @SuppressLint("ViewConstructor")
 internal class PageViewport(
-    context: Context, private val onScroll: () -> Unit, private val onGestureEnd: () -> Unit
+    context: Context, private val onGestureEnd: () -> Unit
 ) : ScrollView(context) {
     private val center = FrameLayout(context)
     private var restoreY: Int? = null
@@ -36,11 +36,6 @@ internal class PageViewport(
         // Restore after ScrollView lays out the new content and knows its scroll range.
         restoreY?.let { scrollTo(0, it) }
         restoreY = null
-    }
-
-    override fun onScrollChanged(x: Int, y: Int, oldX: Int, oldY: Int) {
-        super.onScrollChanged(x, y, oldX, oldY)
-        onScroll()
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {

@@ -414,9 +414,9 @@ class MainActivity : ComponentActivity() {
         content = object : FrameLayout(this) {
             override fun onDescendantInvalidated(child: View, target: View) {
                 super.onDescendantInvalidated(child, target)
-                if (::navigation.isInitialized && navigation.isVisible) navigation.invalidate()
+                if (::navigation.isInitialized && navigation.isVisible) navigation.refreshBackdrop()
             }
-        }
+        }.apply { setBackgroundColor(palette.background) }
         root.addView(content, FrameLayout.LayoutParams(-1, -1))
         navigation = GlassNavigation(this, palette, content, if (expanded) 25 else 32).apply {
             setPadding(dp(5), dp(5), dp(5), dp(5))
@@ -485,13 +485,15 @@ class MainActivity : ComponentActivity() {
     private fun drawNavigation(animate: Boolean = false) {
         updateNavigationVisibility()
         val section = if (tab.inNavigation) tab else backDestination()
+        val inactive = if (palette.night) palette.muted else ColorUtils.blendARGB(palette.ink, palette.muted, .65f)
         for ((item, cell) in navCells) {
             val selected = item == section
             val accent = palette.glyph(item.icon)
             val selectedNow = selected && !cell.view.isSelected
             cell.view.isSelected = selected
-            cell.icon.setColor(if (selected) palette.legible(accent) else palette.muted)
-            cell.label.setTextColor(if (selected) palette.ink else palette.muted)
+            val foreground = if (selected) palette.ink else inactive
+            cell.icon.setColor(foreground)
+            cell.label.setTextColor(foreground)
             if (selected) navigation.select(cell.view, accent, animate)
             cell.icon.animate().cancel()
             cell.icon.translationY = 0f
@@ -731,9 +733,7 @@ class MainActivity : ComponentActivity() {
         val previous = if (samePage) {
             if (keepScroll) existing?.position ?: 0 else 0
         } else tabPositions[tab] ?: 0
-        val viewport = existing ?: PageViewport(this, onScroll = {
-            if (navigation.isVisible) navigation.invalidate()
-        }, onGestureEnd = {
+        val viewport = existing ?: PageViewport(this, onGestureEnd = {
             val pending = deferredRefresh
             if (pending != null) {
                 deferredRefresh = null
@@ -749,7 +749,7 @@ class MainActivity : ComponentActivity() {
         val page = column().apply { setPadding(dp(18), dp(16), dp(18), dp(24)) }
         val pageWidth = if (expanded && resources.configuration.screenWidthDp - RAIL_SPACE > 680) dp(680) else -1
         viewport.show(page, pageWidth, previous)
-        navigation.invalidate()
+        navigation.refreshBackdrop()
         if (!tab.inNavigation && tab != Tab.DAILY_ACTIVITY) pageHeader(page)
         when (tab) {
             Tab.TODAY -> today(page)
